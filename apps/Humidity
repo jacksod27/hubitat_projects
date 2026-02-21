@@ -94,17 +94,26 @@ def initialize() {
     state.inCooldown = false
     state.currentSetpoint = null
 
-    // Subscribe to real-time events
     subscribe(humiditySensor, "humidity", humidityHandler)
     subscribe(outdoorTempSensor, "temperature", tempHandler)
 
-    // CORRECTED: Schedule polling every 30 minutes
-    schedule("0 */${pollInterval ?: 30} * * * ?", pollHumidity)
+    // FIXED: Reliable 30min polling
+    unschedule("pollHumidity")
+    runIn(1800, repeatedPollHumidity)  // Start chain
 
-    // Timer checks every minute
     runIn(60, timerCheck)
+    logDebug "Initialized with reliable 30min polling"
+}
 
-    logDebug "Initialized. Polling every ${(pollInterval ?: 30)}min."
+def repeatedPollHumidity() {
+    pollHumidity()
+    runIn(1800, repeatedPollHumidity)  // Chain next poll
+}
+
+def pollHumidity() {
+    logDebug "=== 30min POLL ==="
+    humiditySensor.refresh()
+    runIn(30, humidityHandler)  // Check 30sec after refresh
 }
 
 def pollHumidity() {
