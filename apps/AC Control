@@ -16,7 +16,7 @@ preferences {
 def mainPage() {
     dynamicPage(name: "mainPage", title: "Automated AC Control", install: true, uninstall: true) {
         section("Shared Devices") {
-            input "outdoorWeather", "device.openWeatherMap", title: "OpenWeather Outdoor Temp Device", required: true, multiple: false
+            input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap Outdoor Temp Device", required: true, multiple: false
         }
         section("Room Pairs (Multi-Select for Multiple Rooms)") {
             input "indoorSensors", "capability.temperatureMeasurement", title: "Indoor Temp Sensors (one per room)", required: true, multiple: true
