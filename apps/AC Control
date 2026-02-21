@@ -2,7 +2,7 @@ definition(
     name: "Automated AC Control",
     namespace: "custom",
     author: "Perplexity",
-    description: "One room: Outdoor > indoor → AC auto + outdoor setpoint (30min checks). Clone for more rooms.",
+    description: "One room: Outdoor > indoor → AC auto + outdoor setpoint (30min checks). Clone & rename for rooms.",
     category: "Green Living",
     iconUrl: "",
     iconX2Url: "",
@@ -15,24 +15,37 @@ preferences {
 
 def mainPage() {
     dynamicPage(name: "mainPage", title: "AC Control (One Room Pair)", install: true, uninstall: true) {
-        section("This Room's Devices") {
+        section("Instance Name") {
+            label title: "App Name (e.g., 'Front Room AC')", required: true
+        }
+        section("Devices") {
             input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap Device", required: true
             input "indoorSensor", "capability.temperatureMeasurement", title: "Indoor Temp Sensor", required: true
             input "acThermostat", "capability.thermostat", title: "Thermostat/AC Unit", required: true
         }
         section("Preview") {
-            paragraph "<b>${indoorSensor?.displayName ?: 'Select'} → ${acThermostat?.displayName ?: 'Select'}</b>"
-            paragraph "<small>Clone app (Add User App) for additional rooms.</small>"
+            paragraph "<b>[${label ?: 'Unnamed'}] ${indoorSensor?.displayName ?: '?'} → ${acThermostat?.displayName ?: '?'}</b>"
+        }
+        section("Schedule (Optional)") {
+    		input "days", "enum", title: "Days Only", multiple: true, required: false,
+        		options: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    		input "modes", "mode", title: "Modes Only", multiple: true, required: false
+    		input "startTime", "time", title: "From Time", required: false
+    		input "endTime", "time", title: "Until Time", required
         }
     }
 }
 
+
+
 def installed() {
+    log.info "Installed: ${app.label}"
     initialize()
 }
 
 def updated() {
     unschedule()
+    log.info "Updated: ${app.label} (${indoorSensor.displayName} → ${acThermostat.displayName})"
     initialize()
 }
 
@@ -41,25 +54,25 @@ def initialize() {
     subscribe(outdoorWeather, "temperature", tempHandler)
     runEvery30Minutes("tempHandler")
     runIn(30, tempHandler)
-    log.info "${indoorSensor.displayName} → ${acThermostat.displayName} initialized"
 }
 
 def tempHandler(evt = null) {
+    def instance = app.label ?: "Unnamed"
     def outdoorTemp = outdoorWeather.currentValue("temperature")?.toBigDecimal()
     def indoorTemp = indoorSensor.currentValue("temperature")?.toBigDecimal()
     
     if (!outdoorTemp || !indoorTemp) {
-        log.warn "Missing temps: outdoor=${outdoorTemp}, indoor=${indoorTemp}"
+        log.warn "${instance}: Missing temps (out:${outdoorTemp}, in:${indoorTemp})"
         return
     }
     
-    log.info "${indoorSensor.displayName}: indoor ${indoorTemp}° vs outdoor ${outdoorTemp}°"
+    log.info "${instance}: ${indoorSensor.displayName} ${indoorTemp}° vs outdoor ${outdoorTemp}°"
     
     if (outdoorTemp > indoorTemp) {
-        log.info "❄️ ${acThermostat.displayName}: AUTO + ${outdoorTemp}°"
+        log.info "${instance}: ❄️ ${acThermostat.displayName} → AUTO + ${outdoorTemp}°"
         acThermostat.setThermostatMode("auto")
         acThermostat.setCoolingSetpoint(outdoorTemp)
     } else {
-        log.info "No action needed"
+        log.info "${instance}: No action"
     }
 }
