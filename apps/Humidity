@@ -98,14 +98,13 @@ def initialize() {
     subscribe(humiditySensor, "humidity", humidityHandler)
     subscribe(outdoorTempSensor, "temperature", tempHandler)
 
-    // Schedule polling every X minutes
-    def pollMins = pollInterval ?: 30
-    "runEvery${pollMins > 59 ? 'N' : ''}Minutes"(pollHumidity, pollMins)
+    // CORRECTED: Schedule polling every 30 minutes
+    schedule("0 */${pollInterval ?: 30} * * * ?", pollHumidity)
 
-    // Timer checks
-    runIn(60, timerCheck)  // Check every minute after init
+    // Timer checks every minute
+    runIn(60, timerCheck)
 
-    logDebug "Initialized. Polling every ${pollMins}min."
+    logDebug "Initialized. Polling every ${(pollInterval ?: 30)}min."
 }
 
 def pollHumidity() {
@@ -192,7 +191,7 @@ def restoreUnits() {
 
 def timerCheck() {
     if (!state.dryActive || !state.sessionStart) {
-        schedule("0 * * * * ?", timerCheck)  // Every minute
+        runIn(60, timerCheck)  // Fixed: use runIn instead of schedule
         return
     }
 
@@ -201,7 +200,7 @@ def timerCheck() {
         logInfo "Max run time reached (${runMins}min)"
         forceEndDry()
     } else {
-        schedule("0 * * * * ?", timerCheck)
+        runIn(60, timerCheck)  // Check again in 1 minute
     }
 }
 
