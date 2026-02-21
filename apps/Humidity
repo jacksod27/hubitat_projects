@@ -116,12 +116,6 @@ def pollHumidity() {
     runIn(30, humidityHandler)  // Check 30sec after refresh
 }
 
-def pollHumidity() {
-    humiditySensor.refresh()  // Trigger sensor to update if supported
-    // Handler will fire on event or use last known
-    runIn(30, humidityHandler)  // Fallback check after refresh
-}
-
 def humidityHandler(evt) {
     if (state.inCooldown) return
     def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
