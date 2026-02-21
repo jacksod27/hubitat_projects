@@ -1,8 +1,8 @@
 definition(
-    name: "AC Control",
+    name: "Automated AC Control",
     namespace: "custom",
     author: "Perplexity",
-    description: "Controls AC when outdoor > indoor temp, checks every 30 min",
+    description: "One room: Outdoor > indoor → AC auto + outdoor setpoint (30min checks). Clone for more rooms.",
     category: "Green Living",
     iconUrl: "",
     iconX2Url: "",
@@ -14,16 +14,15 @@ preferences {
 }
 
 def mainPage() {
-    dynamicPage(name: "mainPage", title: "Automated AC Control", install: true, uninstall: true) {
-        section("Shared Devices") {
-            input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap Outdoor Temp Device", required: true, multiple: false
+    dynamicPage(name: "mainPage", title: "AC Control (One Room Pair)", install: true, uninstall: true) {
+        section("This Room's Devices") {
+            input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap Device", required: true
+            input "indoorSensor", "capability.temperatureMeasurement", title: "Indoor Temp Sensor", required: true
+            input "acThermostat", "capability.thermostat", title: "Thermostat/AC Unit", required: true
         }
-        section("Room Pairs (Multi-Select for Multiple Rooms)") {
-            input "indoorSensors", "capability.temperatureMeasurement", title: "Indoor Temp Sensors (one per room)", required: true, multiple: true
-            input "acThermostats", "device.ThermostatController", title: "Thermostat Controller ACs (match to sensors)", required: true, multiple: true
-        }
-        section("Notes") {
-            paragraph "Select same number of sensors and thermostats. App applies logic to each pair (sensor[i] -> thermostat[i])."
+        section("Preview") {
+            paragraph "<b>${indoorSensor?.displayName ?: 'Select'} → ${acThermostat?.displayName ?: 'Select'}</b>"
+            paragraph "<small>Clone app (Add User App) for additional rooms.</small>"
         }
     }
 }
@@ -38,42 +37,29 @@ def updated() {
 }
 
 def initialize() {
+    subscribe(indoorSensor, "temperature", tempHandler)
+    subscribe(outdoorWeather, "temperature", tempHandler)
     runEvery30Minutes("tempHandler")
     runIn(30, tempHandler)
+    log.info "${indoorSensor.displayName} → ${acThermostat.displayName} initialized"
 }
 
-def tempHandler() {
+def tempHandler(evt = null) {
     def outdoorTemp = outdoorWeather.currentValue("temperature")?.toBigDecimal()
-    if (!outdoorTemp) {
-        log.warn "Missing outdoor temperature data"
+    def indoorTemp = indoorSensor.currentValue("temperature")?.toBigDecimal()
+    
+    if (!outdoorTemp || !indoorTemp) {
+        log.warn "Missing temps: outdoor=${outdoorTemp}, indoor=${indoorTemp}"
         return
     }
     
-    def numPairs = indoorSensors?.size() ?: 0
-    if (numPairs != acThermostats?.size()) {
-        log.warn "Mismatch in sensor/thermostat count: ${numPairs} vs ${acThermostats?.size()}"
-        return
-    }
+    log.info "${indoorSensor.displayName}: indoor ${indoorTemp}° vs outdoor ${outdoorTemp}°"
     
-    log.info "30min check - Outdoor: ${outdoorTemp}°"
-    
-    indoorSensors.eachWithIndex { sensor, index ->
-        def indoorTemp = sensor.currentValue("temperature")?.toBigDecimal()
-        def thermostat = acThermostats[index]
-        
-        if (!indoorTemp) {
-            log.warn "Missing indoor temp for ${sensor.displayName}"
-            return
-        }
-        
-        log.info "${sensor.displayName}: Indoor ${indoorTemp}°"
-        
-        if (outdoorTemp > indoorTemp) {
-            log.info "${sensor.displayName}: Outdoor > Indoor - Set ${thermostat.displayName} to auto, setpoint ${outdoorTemp}"
-            thermostat.setThermostatMode("auto")
-            thermostat.setCoolingSetpoint(outdoorTemp)
-        } else {
-            log.info "${sensor.displayName}: No action"
-        }
+    if (outdoorTemp > indoorTemp) {
+        log.info "❄️ ${acThermostat.displayName}: AUTO + ${outdoorTemp}°"
+        acThermostat.setThermostatMode("auto")
+        acThermostat.setCoolingSetpoint(outdoorTemp)
+    } else {
+        log.info "No action needed"
     }
 }
