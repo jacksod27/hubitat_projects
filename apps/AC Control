@@ -1,0 +1,58 @@
+definition(
+    name: "Outdoor AC Control",
+    namespace: "custom",
+    author: "Perplexity",
+    description: "Controls AC when outdoor > indoor temp, checks every 30 min",
+    category: "Green Living",
+    iconUrl: "",
+    iconX2Url: "",
+    singleInstance: false
+)
+
+preferences {
+    page name: "mainPage"
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Outdoor AC Control", install: true, uninstall: true) {
+        section("Devices") {
+            input "outdoorWeather", "device.openWeatherMap", title: "OpenWeather Outdoor Temp Device", required: true
+            input "indoorSensor", "capability.temperatureMeasurement", title: "Front Room Temp Sensor", required: true
+            input "acThermostat", "capability.thermostatCooling", title: "Front Room AC Thermostat", required: true
+        }
+    }
+}
+
+def installed() {
+    initialize()
+}
+
+def updated() {
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    runEvery30Minutes("tempHandler")
+    runIn(30, tempHandler)
+}
+
+def tempHandler() {
+    def outdoorTemp = outdoorWeather.currentValue("temperature")?.toBigDecimal()
+    def indoorTemp = indoorSensor.currentValue("temperature")?.toBigDecimal()
+    
+    if (!outdoorTemp || !indoorTemp) {
+        log.warn "Missing temperature data"
+        return
+    }
+    
+    log.info "30min check - Outdoor: ${outdoorTemp}°, Indoor: ${indoorTemp}°"
+    
+    if (outdoorTemp > indoorTemp) {
+        log.info "Outdoor > Indoor: Turn on AC, set to auto, coolingSetpoint = ${outdoorTemp}"
+        acThermostat.setThermostatMode("auto")
+        acThermostat.setCoolingSetpoint(outdoorTemp)
+    } else {
+        log.info "Outdoor <= Indoor: No action"
+    }
+}
