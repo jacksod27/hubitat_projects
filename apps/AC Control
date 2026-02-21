@@ -2,7 +2,7 @@ definition(
     name: "Automated AC Control",
     namespace: "custom",
     author: "Perplexity",
-    description: "One room: Outdoor > indoor → AC auto + outdoor setpoint (30min checks). Clone & rename for rooms.",
+    description: "Outdoor > indoor → AC auto + setpoint. Schedules: days/time/modes.",
     category: "Green Living",
     iconUrl: "",
     iconX2Url: "",
@@ -14,29 +14,27 @@ preferences {
 }
 
 def mainPage() {
-    dynamicPage(name: "mainPage", title: "AC Control (One Room Pair)", install: true, uninstall: true) {
+    dynamicPage(name: "mainPage", title: "AC Control w/ Schedule", install: true, uninstall: true) {
         section("Instance Name") {
             label title: "App Name (e.g., 'Front Room AC')", required: true
         }
         section("Devices") {
-            input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap Device", required: true
-            input "indoorSensor", "capability.temperatureMeasurement", title: "Indoor Temp Sensor", required: true
-            input "acThermostat", "capability.thermostat", title: "Thermostat/AC Unit", required: true
+            input "outdoorWeather", "device.OpenWeatherMap", title: "OpenWeatherMap", required: true
+            input "indoorSensor", "capability.temperatureMeasurement", title: "Indoor Sensor", required: true
+            input "acThermostat", "capability.thermostat", title: "Thermostat/AC", required: true
+        }
+        section("Schedule (Optional - Leave blank to always run)") {
+            input "days", "enum", title: "Days", multiple: true, 
+                options: [["Monday":"Monday"],["Tuesday":"Tuesday"],["Wednesday":"Wednesday"],["Thursday":"Thursday"],["Friday":"Friday"],["Saturday":"Saturday"],["Sunday":"Sunday"]]
+            input "modes", "mode", title: "Modes", multiple: true
+            input "startTime", "time", title: "Start Time"
+            input "endTime", "time", title: "End Time"
         }
         section("Preview") {
-            paragraph "<b>[${label ?: 'Unnamed'}] ${indoorSensor?.displayName ?: '?'} → ${acThermostat?.displayName ?: '?'}</b>"
-        }
-        section("Schedule (Optional)") {
-    		input "days", "enum", title: "Days Only", multiple: true, required: false,
-        		options: ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-    		input "modes", "mode", title: "Modes Only", multiple: true, required: false
-    		input "startTime", "time", title: "From Time", required: false
-    		input "endTime", "time", title: "Until Time", required
+            paragraph "<b>[${label}] ${indoorSensor?.displayName} → ${acThermostat?.displayName}</b>"
         }
     }
 }
-
-
 
 def installed() {
     log.info "Installed: ${app.label}"
@@ -45,34 +43,82 @@ def installed() {
 
 def updated() {
     unschedule()
-    log.info "Updated: ${app.label} (${indoorSensor.displayName} → ${acThermostat.displayName})"
+    log.info "Updated: ${app.label}"
     initialize()
 }
 
 def initialize() {
     subscribe(indoorSensor, "temperature", tempHandler)
     subscribe(outdoorWeather, "temperature", tempHandler)
+    subscribe(location, "mode", scheduleCheck)
     runEvery30Minutes("tempHandler")
-    runIn(30, tempHandler)
+    runIn(30, scheduleCheck)
+    log.info "${app.label}: Initialized with schedule"
 }
 
-def tempHandler(evt = null) {
-    def instance = app.label ?: "Unnamed"
-    def outdoorTemp = outdoorWeather.currentValue("temperature")?.toBigDecimal()
-    def indoorTemp = indoorSensor.currentValue("temperature")?.toBigDecimal()
+def scheduleCheck(evt = null) {
+    def now = new Date()
+    def allowRun = true
     
-    if (!outdoorTemp || !indoorTemp) {
-        log.warn "${instance}: Missing temps (out:${outdoorTemp}, in:${indoorTemp})"
+    // Days check
+    if (days && !days.contains(location.timeZone.format('EEEE', now))) {
+        allowRun = false
+    }
+    
+    // Modes check
+    if (modes && !modes.contains(location.mode)) {
+        allowRun = false
+    }
+    
+    // Time check
+    if (startTime || endTime) {
+        def currentTime = timeToday(now.format('HH:mm'))
+        def st = timeTodayAfter(startTime ?: "00:00", now.format('HH:mm'))
+        def et = timeTodayAfter(endTime ?: "23:59", now.format('HH:mm'))
+        if (currentTime < st || currentTime > et) {
+            allowRun = false
+        }
+    }
+    
+    state.allowRun = allowRun
+    log.info "${app.label}: Schedule ${allowRun ? 'ENABLED' : 'DISABLED'} (${location.mode}, ${now.format('EEE HH:mm')})"
+}
+
+def tempHandler(evt) {
+    if (!state.allowRun) {
+        log.debug "${app.label}: Skipped - outside schedule"
         return
     }
     
-    log.info "${instance}: ${indoorSensor.displayName} ${indoorTemp}° vs outdoor ${outdoorTemp}°"
+    def instance = app.label
+    def outdoorTemp = outdoorWeather.currentValue("temperature")?.toBigDecimal()
+    def indoorTemp = indoorSensor.currentValue("temperature")?.toBigDecimal()
+    def currentSetpoint = acThermostat.currentValue("coolingSetpoint")?.toBigDecimal()
+    def operatingState = acThermostat.currentValue("thermostatOperatingState") ?: "idle"
+    
+    if (!outdoorTemp || !indoorTemp) {
+        log.warn "${instance}: Missing temps"
+        return
+    }
+    
+    log.info "${instance}: Indoor ${indoorTemp}° vs Outdoor ${outdoorTemp}° (current setpoint: ${currentSetpoint ?: 'none'}, state: ${operatingState})"
     
     if (outdoorTemp > indoorTemp) {
-        log.info "${instance}: ❄️ ${acThermostat.displayName} → AUTO + ${outdoorTemp}°"
-        acThermostat.setThermostatMode("auto")
-        acThermostat.setCoolingSetpoint(outdoorTemp)
+        // Failsafe: Skip if current setpoint already lower/better than outdoor
+        if (currentSetpoint && currentSetpoint < outdoorTemp) {
+            log.info "${instance}: Failsafe - current ${currentSetpoint}° < outdoor ${outdoorTemp}° → no change"
+            return
+        }
+        
+        // Extra safety: Only if cooling or idle
+        if (operatingState in ["cooling", "idle"]) {
+            log.info "${instance}: ❄️ AUTO + ${outdoorTemp}°"
+            acThermostat.setThermostatMode("auto")
+            acThermostat.setCoolingSetpoint(outdoorTemp)
+        } else {
+            log.info "${instance}: Skip - operatingState ${operatingState} not cooling/idle"
+        }
     } else {
-        log.info "${instance}: No action"
+        log.info "${instance}: No action (outdoor ≤ indoor)"
     }
 }
