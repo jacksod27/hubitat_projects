@@ -142,6 +142,7 @@ def startDrySession() {
 
     mideaUnits.each { dev ->
         dev.setThermostatMode("dry")
+        dev.on()
         updateSetpoint(dev)
         dev.setThermostatFanMode(fanMode)
         setSwing(dev)
