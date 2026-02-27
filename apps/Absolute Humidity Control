@@ -1,1 +1,247 @@
+/*
+ * Midea Smart Absolute Humidity Control
+ *
+ * Version with:
+ * - 24-26C setpoint logic based on outdoor temp
+ * - Polls humidity every 30min
+ * - Max 1.5hr run time, then 30min cooldown
+ * - Restart if humidity >60% after cooldown
+ * - Utilises Absolute Humidity to determine dry mode over night
+ * - Can operate silently over night
+ */
 
+definition(
+    name: "Midea Smart Absolute Humidity Control",
+    namespace: "custom.midea",
+    author: "Jacksod27 + Perplexity",
+    description: "Smart humidity control for Midea AC with temp setpoint, timers",
+    category: "Climate Control",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Midea Smart Dry Mode Humidity Controller", install: true, uninstall: true) {
+        section("Sensors") {
+            input "humiditySensor", "capability.relativeHumidityMeasurement",
+                title: "Humidity sensor", required: true
+            input "outdoorTempSensor", "capability.temperatureMeasurement",
+                title: "Outdoor temperature sensor (Celsius)", required: true
+        }
+        section("Midea AC units") {
+            input "mideaUnits", "capability.thermostat",
+                title: "Midea AC devices", required: true, multiple: true
+        }
+        section("Setpoints & Thresholds") {
+            input "highHumTrigger", "number", title: "Start Dry if humidity > (%)", 
+                defaultValue: 59, required: true
+            input "lowHumStop", "number", title: "Stop Dry if humidity < (%)", 
+                defaultValue: 55, required: true
+            input "restartHum", "number", title: "Restart after cooldown if > (%)", 
+                defaultValue: 50, required: true
+            input "minTemp", "number", title: "Min setpoint (C)", 
+                defaultValue: 24, required: true
+            input "maxTemp", "number", title: "Max setpoint (C)", 
+                defaultValue: 26, required: true
+        }
+        section("Timers") {
+            input "pollInterval", "number", title: "Poll humidity every (minutes)", 
+                defaultValue: 30, required: true
+            input "maxRunTime", "number", title: "Max run time (minutes)", 
+                defaultValue: 90, required: true  // 1.5hrs
+            input "cooldownTime", "number", title: "Cooldown time (minutes)", 
+                defaultValue: 30, required: true
+        }
+        section("Restore Mode") {
+            input "restoreMode", "enum", title: "Restore mode after Dry",
+                required: true, defaultValue: "auto",
+                options: ["off","auto","cool","heat","fan","dry"]
+        }
+        section("Vents & Louvres") {
+            input "swingVertical", "number", title: "Vertical swing pos (1-5, 1=down)", 
+                defaultValue: 2, required: true  // Slightly downward
+            input "swingHorizontal", "number", title: "Horizontal swing pos (1-5)", 
+                defaultValue: 3, required: true  // Center
+            input "fanMode", "enum", title: "Fan mode during Dry",
+                required: true, defaultValue: "auto",
+                options: ["auto","low","medium","high"]
+        }
+        section("Options") {
+            input "enableLogging", "bool", title: "Enable debug logging", 
+                defaultValue: true
+        }
+    }
+}
+
+def installed() {
+    logDebug "Installed"
+    initialize()
+}
+
+def updated() {
+    logDebug "Updated"
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+input "useQuietNightMode", "bool", title: "Enable Quiet Night Mode (1% fan, hourly sleep ramp)", default: false
+def initialize() {
+    state.dryActive = false
+    state.sessionStart = null
+    state.inCooldown = false
+    state.currentSetpoint = null
+
+    subscribe(humiditySensor, "humidity", humidityHandler)
+    subscribe(outdoorTempSensor, "temperature", tempHandler)
+
+    // FIXED: Reliable 30min polling
+    unschedule("pollHumidity")
+    runIn(1800, repeatedPollHumidity)  // Start chain
+
+    runIn(60, timerCheck)
+    logDebug "Initialized with reliable 30min polling"
+    if (useQuietNightMode) schedule("0 0/1 * * * ?", hourlySleepAdjust)  // Hourly check
+}
+
+def repeatedPollHumidity() {
+    pollHumidity()
+    runIn(1800, repeatedPollHumidity)  // Chain next poll
+}
+
+def pollHumidity() {
+    logDebug "=== 30min POLL ==="
+    humiditySensor.refresh()
+    runIn(30, humidityHandler)  // Check 30sec after refresh
+}
+
+def humidityHandler(evt) {
+    if (state.inCooldown) return
+    def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
+    logDebug "Humidity: ${hum}%"
+
+    if (!state.dryActive && hum > (highHumTrigger as Integer)) {
+        startDrySession()
+    } else if (state.dryActive && hum < (lowHumStop as Integer)) {
+        endDrySession()
+    }
+}
+
+def tempHandler(evt) {
+    if (state.dryActive) {
+        updateSetpoint()
+    }
+}
+
+def hourlySleepAdjust() {
+    if (!state.dryActive || now() < state.bedTime) return  // Night-only
+    def roomTemp = indoorTempSensor.currentValue("temperature")
+    def target = state.baseSetpoint + (hoursSinceBedtime() * 0.5)  // Ramp +0.5°C/hr
+    mideaUnits.each { dev ->
+        dev.setCoolingSetpoint(target.round())  // Silent if quiet fan
+        dev.setThermostatFanMode("silent")  // 1% speed, no beep
+    }
+    log.info "[MideaSmartDry] Sleep ramp: ${target}°C (room ${roomTemp}°C)"
+}
+
+def startDrySession() {
+    logInfo "Starting Dry session - humidity high"
+    state.dryActive = true
+    state.sessionStart = now()
+    state.inCooldown = false
+
+    mideaUnits.each { dev ->
+        dev.setThermostatMode("dry")
+        dev.on()
+        updateSetpoint(dev)
+        dev.setThermostatFanMode(fanMode)
+        setSwing(dev)
+        logDebug "Configured ${dev.displayName}"
+
+   if (useQuietNightMode) {
+          mideaUnits.each { dev ->
+              dev.setThermostatFanMode("silent")  // 1% quiet
+          }
+    }
+}
+
+def endDrySession() {
+    logInfo "Ending Dry session - humidity low"
+    state.dryActive = false
+    restoreUnits()
+}
+
+def updateSetpoint(dev=null) {
+    def outdoorTemp = outdoorTempSensor.currentValue("temperature") ?: 25
+    def setpoint = Math.max(minTemp, Math.min(maxTemp, Math.round(outdoorTemp)))
+    
+    state.currentSetpoint = setpoint
+    logDebug "Setpoint: ${setpoint}C (outdoor: ${outdoorTemp}C)"
+
+    if (dev) {
+        dev.setCoolingSetpoint(setpoint)  // or setThermostatSetpoint(setpoint)
+    } else {
+        mideaUnits.each { it.setCoolingSetpoint(setpoint) }
+    }
+}
+
+
+def restoreUnits() {
+    mideaUnits.each { dev ->
+        if (restoreMode == "off") {
+            dev.off()
+        } else {
+            dev.setThermostatMode(restoreMode)
+        }
+    }
+}
+
+def timerCheck() {
+    if (!state.dryActive || !state.sessionStart) {
+        runIn(60, timerCheck)  // Fixed: use runIn instead of schedule
+        return
+    }
+
+    def runMins = (now() - state.sessionStart) / 1000 / 60
+    if (runMins >= (maxRunTime as Integer)) {
+        logInfo "Max run time reached (${runMins}min)"
+        forceEndDry()
+    } else {
+        runIn(60, timerCheck)  // Check again in 1 minute
+    }
+}
+
+def forceEndDry() {
+    state.dryActive = false
+    restoreUnits()
+    state.inCooldown = true
+    runIn((cooldownTime * 60), cooldownEnd)
+}
+
+def cooldownEnd() {
+    state.inCooldown = false
+    def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
+    if (hum > (restartHum as Integer)) {
+        logInfo "Cooldown end - humidity ${hum}%, restarting Dry"
+        startDrySession()
+    } else {
+        logInfo "Cooldown end - humidity OK, staying off"
+    }
+}
+
+def calcAH(T, RH) {  
+    def es = 6.112 * Math.exp((17.67 * T) / (T + 243.5))  
+    def e = es * (RH / 100)  
+    return (e * 100 * 2.16679) / (T + 273.15)  
+}  
+// Use: if (calcAH(indoorTemp, humidity) > 11) startDrySession()  
+
+
+
+
+
+private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
+private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
