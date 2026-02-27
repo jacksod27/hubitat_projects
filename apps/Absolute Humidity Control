@@ -31,6 +31,8 @@ def mainPage() {
                 title: "Humidity sensor", required: true
             input "outdoorTempSensor", "capability.temperatureMeasurement",
                 title: "Outdoor temperature sensor (Celsius)", required: true
+            input "indoorTempSensor", "capability.temperatureMeasurement", 
+                title: "Indoor temperature sensor", required: true
         }
         section("Midea AC units") {
             input "mideaUnits", "capability.thermostat",
@@ -61,18 +63,15 @@ def mainPage() {
                 required: true, defaultValue: "auto",
                 options: ["off","auto","cool","heat","fan","dry"]
         }
-        section("Vents & Louvres") {
-            input "swingVertical", "number", title: "Vertical swing pos (1-5, 1=down)", 
-                defaultValue: 2, required: true  // Slightly downward
-            input "swingHorizontal", "number", title: "Horizontal swing pos (1-5)", 
-                defaultValue: 3, required: true  // Center
-            input "fanMode", "enum", title: "Fan mode during Dry",
-                required: true, defaultValue: "auto",
-                options: ["auto","low","medium","high"]
+        section("bedTime") {
+            input "bedTime", "time", title: "Bedtime (for quiet mode)"
         }
+      
         section("Options") {
             input "enableLogging", "bool", title: "Enable debug logging", 
                 defaultValue: true
+            input "useQuietNightMode", "bool", title: "Enable Silent Night Mode (1% fan, hourly sleep ramp)", 
+                default: false
         }
     }
 }
@@ -88,7 +87,7 @@ def updated() {
     unschedule()
     initialize()
 }
-input "useQuietNightMode", "bool", title: "Enable Quiet Night Mode (1% fan, hourly sleep ramp)", default: false
+
 def initialize() {
     state.dryActive = false
     state.sessionStart = null
@@ -105,6 +104,7 @@ def initialize() {
     runIn(60, timerCheck)
     logDebug "Initialized with reliable 30min polling"
     if (useQuietNightMode) schedule("0 0/1 * * * ?", hourlySleepAdjust)  // Hourly check
+    schedule(bedTime, enableBedtimeMode)
 }
 
 def repeatedPollHumidity() {
@@ -128,6 +128,8 @@ def humidityHandler(evt) {
     } else if (state.dryActive && hum < (lowHumStop as Integer)) {
         endDrySession()
     }
+    
+    if (calcAH(indoorTempSensor.currentValue("temperature") ?: 25, hum) > 12) startDrySession();
 }
 
 def tempHandler(evt) {
@@ -136,10 +138,14 @@ def tempHandler(evt) {
     }
 }
 
+
+
 def hourlySleepAdjust() {
     if (!state.dryActive || now() < state.bedTime) return  // Night-only
     def roomTemp = indoorTempSensor.currentValue("temperature")
     def target = state.baseSetpoint + (hoursSinceBedtime() * 0.5)  // Ramp +0.5°C/hr
+    def ah = calcAH(roomTemp, hum); 
+    def targetTemp = state.baseSetpoint + (hoursSinceBedtime() * 0.5); if (ah > 11.5) targetTemp -= 0.5;
     mideaUnits.each { dev ->
         dev.setCoolingSetpoint(target.round())  // Silent if quiet fan
         dev.setThermostatFanMode("silent")  // 1% speed, no beep
@@ -187,7 +193,6 @@ def updateSetpoint(dev=null) {
         mideaUnits.each { it.setCoolingSetpoint(setpoint) }
     }
 }
-
 
 def restoreUnits() {
     mideaUnits.each { dev ->
@@ -239,9 +244,11 @@ def calcAH(T, RH) {
 }  
 // Use: if (calcAH(indoorTemp, humidity) > 11) startDrySession()  
 
-
-
-
+def hoursSinceBedtime() {
+    def bedTimeMs = new Date().parse("yyyy-MM-dd'T'HH:mm:ssXXX", 
+    state.bedTime ?: "22:00:00"); 
+    return (now() - bedTimeMs.time) / 1000 / 60 / 60;
+}
 
 private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
 private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
