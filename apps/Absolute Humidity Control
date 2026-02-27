@@ -227,12 +227,14 @@ def forceEndDry() {
 
 def cooldownEnd() {
     state.inCooldown = false
-    def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
-    if (hum > (restartHum as Integer)) {
-        logInfo "Cooldown end - humidity ${hum}%, restarting Dry"
+    def hum = humiditySensor.currentValue("humidity") ?: 0
+    def roomT = indoorTempSensor.currentValue("temperature") ?: 25
+    def ah = calcAH(roomT, hum)
+    if (hum > restartHum || ah > 11) {
+        logInfo "Cooldown end - RH ${hum}%/AH ${ah}g, restarting Dry"
         startDrySession()
     } else {
-        logInfo "Cooldown end - humidity OK, staying off"
+        logInfo "Cooldown end - OK, continue monitoring"
     }
 }
 
