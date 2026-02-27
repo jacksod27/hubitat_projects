@@ -281,14 +281,3 @@ private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
 
 
 
-
-
-
-
-
-
-
-
-
-
-
