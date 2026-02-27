@@ -1,0 +1,221 @@
+/*
+ * Midea Smart Night/Sleep Humidity Control
+ * Single night state with AH control, silent fan fallback, 22-24C sleep ramp
+ */
+
+definition(
+    name: "Midea Smart Night Humidity Control",
+    namespace: "custom.midea",
+    author: "Jacksod27 + Perplexity",
+    description: "Night-only humidity control with AH-based dehumidification & sleep temp ramp",
+    category: "Climate Control",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Midea Night Sleep Controller", install: true, uninstall: true) {
+        section("Sensors") {
+            input "humiditySensor", "capability.relativeHumidityMeasurement", title: "Humidity sensor", required: true
+            input "indoorTempSensor", "capability.temperatureMeasurement", title: "Indoor temperature sensor", required: true
+        }
+        section("Midea AC units") {
+            input "mideaUnits", "capability.thermostat", title: "Midea AC devices", required: true, multiple: true
+        }
+        section("Night Humidity Control") {
+            input "nightAHtarget", "number", title: "Night AH target (g/m3)", defaultValue: 10.5, required: true
+            input "nightAHtolerance", "number", title: "AH tolerance (+- g/m3)", defaultValue: 1.0, required: true
+            input "nightRHthreshold", "number", title: "Emergency RH threshold (%)", defaultValue: 65, required: true
+        }
+        section("Sleep Temperature Ramp") {
+            input "nightStartTemp", "number", title: "Night start temp (C)", defaultValue: 22, required: true
+            input "nightEndTemp", "number", title: "Night end temp (C)", defaultValue: 24, required: true
+        }
+        section("Night Schedule") {
+            input "bedTime", "time", title: "Bedtime (start night mode)", required: true
+            input "wakeTime", "time", title: "Wake time (end night mode)", required: true
+        }
+        section("Logging") {
+            input "enableLogging", "bool", title: "Enable debug logging", defaultValue: true
+            input "logToFile", "bool", title: "Save logs to external file", defaultValue: true
+        }
+    }
+}
+
+def installed() {
+    logDebug "Night Sleep Controller Installed"
+    initialize()
+}
+
+def updated() {
+    logDebug "Night Sleep Controller Updated"
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    state.nightMode = false
+    state.nightSessionStart = null
+    state.currentNightTemp = nightStartTemp
+    state.AHstatus = "monitoring"
+    
+    // Subscribe to sensors
+    subscribe(humiditySensor, "humidity", nightHumidityHandler)
+    subscribe(indoorTempSensor, "temperature", nightTempHandler)
+    
+    // Schedule night mode
+    scheduleNightMode()
+    
+    // Poll every 15 minutes during night
+    runEvery15Minutes(nightCheck)
+    
+    logDebug "Night controller initialized"
+}
+
+// NIGHT MODE SCHEDULING
+def scheduleNightMode() {
+    def bedCron = "0 ${bedTime.split(':')[1].padLeft(2,'0')} ${bedTime.split(':')[0].padLeft(2,'0')} * * ?"
+    def wakeCron = "0 ${wakeTime.split(':')[1].padLeft(2,'0')} ${wakeTime.split(':')[0].padLeft(2,'0')} * * ?"
+    
+    schedule(bedCron, startNightMode)
+    schedule(wakeCron, endNightMode)
+}
+
+// NIGHT MODE CONTROL
+
+def startNightMode() {
+    logInfo "NIGHT MODE STARTED"
+    state.nightMode = true
+    state.nightSessionStart = now()
+    state.currentNightTemp = nightStartTemp
+    
+    mideaUnits.each { dev ->
+        dev.setThermostatMode("dry")
+        dev.on()
+        dev.setCoolingSetpoint(nightStartTemp)
+        dev.setThermostatFanMode("silent")  // Always silent at night start
+    }
+    
+    if (logToFile) saveLogEntry("NIGHT_MODE_START", "22C, silent fan")
+}
+
+def endNightMode() {
+    logInfo "NIGHT MODE ENDED"
+    state.nightMode = false
+    state.nightSessionStart = null
+    
+    mideaUnits.each { dev ->
+        dev.off()
+    }
+    
+    if (logToFile) saveLogEntry("NIGHT_MODE_END", "Units turned off")
+}
+
+def nightHumidityHandler(evt) {
+    if (!state.nightMode) return
+    
+    def hum = humiditySensor.currentValue("humidity") ?: 50
+    def roomTemp = indoorTempSensor.currentValue("temperature") ?: 23
+    def ah = calcAH(roomTemp, hum)
+    
+    logDebug "Night: RH=${hum}%, AH=${ah}g/m3, Target=${nightAHtarget}"
+    
+    def needsDehumidify = ah > (nightAHtarget + nightAHtolerance)
+    def emergencyRH = hum > nightRHthreshold
+    
+    if (needsDehumidify || emergencyRH) {
+        setNightDehumidifyMode()
+        state.AHstatus = "dehumidifying"
+    } else {
+        setNightSilentMode()
+        state.AHstatus = "silent_fan"
+    }
+    
+    if (logToFile) {
+        saveLogEntry("NIGHT_CHECK", "AH=${ah}g/m3 (${state.AHstatus})")
+    }
+}
+
+def nightTempHandler(evt) {
+    if (!state.nightMode) return
+    updateNightTemperature()
+}
+
+def nightCheck() {
+    if (!state.nightMode) return
+    nightHumidityHandler(null)
+    updateNightTemperature()
+}
+
+// NIGHT OPERATION MODES
+
+def setNightDehumidifyMode() {
+    mideaUnits.each { dev ->
+        dev.setThermostatMode("dry")
+        dev.setCoolingSetpoint(state.currentNightTemp)
+        dev.setThermostatFanMode("auto")  // Auto fan for dehumidification
+    }
+}
+
+def setNightSilentMode() {
+    mideaUnits.each { dev ->
+        dev.setThermostatMode("fan")  // Fan mode when no dehumidification needed
+        dev.setCoolingSetpoint(state.currentNightTemp)
+        dev.setThermostatFanMode("silent")  // Always silent fan
+    }
+}
+
+// TEMPERATURE RAMPING (22C -> 24C over 8 hours)
+def updateNightTemperature() {
+    if (!state.nightSessionStart) return
+    
+    def hoursElapsed = (now() - state.nightSessionStart) / (1000 * 60 * 60)
+    def totalRampHours = 8  // Ramp over 8 hours
+    def tempRange = nightEndTemp - nightStartTemp
+    
+    // Linear ramp: 22C -> 24C over 8 hours
+    def newTemp = nightStartTemp + (tempRange * (hoursElapsed / totalRampHours))
+    newTemp = Math.max(nightStartTemp, Math.min(nightEndTemp, newTemp.round()))
+    
+    if (Math.abs(newTemp - state.currentNightTemp) >= 0.5) {
+        state.currentNightTemp = newTemp
+        mideaUnits.each { dev -> dev.setCoolingSetpoint(newTemp) }
+        logDebug "Sleep ramp: ${newTemp}C (after ${hoursElapsed.round(1)}hrs)"
+        
+        if (logToFile) {
+            saveLogEntry("TEMP_RAMP", "${newTemp}C after ${hoursElapsed.round(1)}hrs")
+        }
+    }
+}
+
+// LOGGING TO EXTERNAL FILE (Hubitat File Manager)
+def saveLogEntry(eventType, details) {
+    try {
+        def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss")
+        def logLine = "${timestamp} | ${eventType} | ${details} | AH=${calcAH(indoorTempSensor.currentValue('temperature') ?: 23, humiditySensor.currentValue('humidity') ?: 50)?.round(1)}g/m3\n"
+        
+        // Append to log file (Hubitat stores in /tmp or File Manager)
+        def logFile = "/tmp/midea_night_log.txt"
+        def file = new File(logFile)
+        file.append(logLine)
+        
+        logDebug "Log saved: ${logLine.trim()}"
+    } catch (Exception e) {
+        logDebug "File log error: ${e.message}"
+    }
+}
+
+// UTILITY FUNCTIONS
+def calcAH(T, RH) {
+    def es = 6.112 * Math.exp((17.67 * T) / (T + 243.5))
+    def e = es * (RH / 100)
+    return (e * 100 * 2.16679) / (T + 273.15)
+}
+
+private logDebug(msg) { if (enableLogging) log.debug "[NightSleep] ${msg}" }
+private logInfo(msg) { log.info "[NightSleep] ${msg}" }
