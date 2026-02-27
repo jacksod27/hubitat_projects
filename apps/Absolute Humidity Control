@@ -106,20 +106,20 @@ def initialize() {
     if (useQuietNightMode) {
         runEvery1Hour(hourlySleepAdjust)  // Better than cron
     }
-    // Fix bedtime: schedule daily at bedTime (parse properly)
     if (bedTime) {
-        def cron = "0 ${bedTime.split(':')[1]} ${bedTime.split(':')[0]} * * ?"  // e.g., "0 0 22 * * ?"
-        schedule(cron, enableBedtimeMode)
+    def parts = bedTime.split(':')
+    if (parts.size() == 2) {
+        def cron = "0 ${parts[1].padLeft(2,'0')} ${parts[0].padLeft(2,'0')} * * ?"
+        schedule(cron, bedtimeTrigger)
+        }
     }
     logDebug "Initialized"
 }
 
 def repeatedPollHumidity() {
     pollHumidity()
-    runIn((pollInterval * 60), repeatedPollHumidity)  // Chain next poll
+    runIn((pollInterval * 60), repeatedPollHumidity)  // Use setting
 }
-
-
 
 def pollHumidity() {
     logDebug "=== 30min POLL ==="
@@ -147,10 +147,9 @@ def tempHandler(evt) {
         updateSetpoint()
     }
 }
-
-def enableBedtimeMode() {
+def bedtimeTrigger() {
+    logDebug "Bedtime triggered"
     state.isBedtime = true
-    logDebug "Bedtime mode enabled"
 }
 
 def startDrySession() {
@@ -173,16 +172,20 @@ def startDrySession() {
 }
 
 def hourlySleepAdjust() {
-    if (!state.dryActive || now() < state.bedTime) return  // Night-only
-    def roomTemp = indoorTempSensor.currentValue("temperature")
-    def target = state.baseSetpoint + (hoursSinceBedtime() * 0.5)  // Ramp +0.5°C/hr
-    def ah = calcAH(roomTemp, hum); 
-    def targetTemp = state.baseSetpoint + (hoursSinceBedtime() * 0.5); if (ah > 11.5) targetTemp -= 0.5;
+    if (!state.dryActive || !isBedtimeNow()) return
+    def roomTemp = indoorTempSensor.currentValue("temperature") ?: 25
+    def hum = humiditySensor.currentValue("humidity") ?: 50
+    def ah = calcAH(roomTemp, hum)
+    def hoursSince = hoursSinceBedtime()
+    def baseSet = state.currentSetpoint ?: 25
+    def targetTemp = baseSet + (hoursSince * 0.5)
+    if (ah > 11.5) targetTemp -= 0.5
+    
     mideaUnits.each { dev ->
-        dev.setCoolingSetpoint(target.round())  // Silent if quiet fan
-        dev.setThermostatFanMode("silent")  // 1% speed, no beep
+        dev.setCoolingSetpoint(targetTemp.round())
+        dev.setThermostatFanMode("silent")
     }
-    log.info "[MideaSmartDry] Sleep ramp: ${target}°C (room ${roomTemp}°C)"
+    log.info "[MideaSmartDry] Sleep ramp: ${targetTemp.round()}°C (room ${roomTemp}°C, AH ${ah}g/m³)"
 }
 
 
@@ -211,8 +214,10 @@ def restoreUnits() {
         if (restoreMode == "off") {
             dev.off()
         } else {
+            dev.off()  // Ensure off first
             dev.setThermostatMode(restoreMode)
-            dev.on()  // Ensure it runs
+            pauseExecution(1000)  // Brief delay for mode settle
+            dev.on()
         }
     }
 }
@@ -262,17 +267,16 @@ def calcAH(T, RH) {
 def hoursSinceBedtime() {
     if (!bedTime) return 0
     def nowTime = new Date()
-    def bedToday = timeTodayAfter(bedTime, location.timeZone)  // Correct args [web:27]
+    def bedToday = timeTodayAfter(bedTime, location.timeZone)
     def elapsed = nowTime.time - bedToday.time
-    return elapsed > 0 ? elapsed / (1000*60*60) : 0  // Avoid negative
+    return Math.max(0, elapsed / (1000 * 60 * 60))  // Floor to hours, no negative
 }
-
 
 private boolean isBedtimeNow() {
     if (!bedTime) return false
     def nowTime = new Date()
     def bedToday = timeTodayAfter(bedTime, location.timeZone)
-    return nowTime.time >= bedToday.time  // Current bedtime or after
+    return nowTime.time >= bedToday.time
 }
 
 private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
