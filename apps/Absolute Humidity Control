@@ -93,18 +93,25 @@ def initialize() {
     state.sessionStart = null
     state.inCooldown = false
     state.currentSetpoint = null
+    state.fanMode = "auto"  // Define missing vars
 
     subscribe(humiditySensor, "humidity", humidityHandler)
+    subscribe(indoorTempSensor, "temperature", humidityHandler)  // Add this
     subscribe(outdoorTempSensor, "temperature", tempHandler)
 
-    // FIXED: Reliable 30min polling
-    unschedule("pollHumidity")
-    runIn(1800, repeatedPollHumidity)  // Start chain
-
+    unschedule()
+    runIn(1800, repeatedPollHumidity)
     runIn(60, timerCheck)
-    logDebug "Initialized with reliable 30min polling"
-    if (useQuietNightMode) schedule("0 0/1 * * * ?", hourlySleepAdjust)  // Hourly check
-    schedule(bedTime, enableBedtimeMode)
+    
+    if (useQuietNightMode) {
+        runEvery1Hour(hourlySleepAdjust)  // Better than cron
+    }
+    // Fix bedtime: schedule daily at bedTime (parse properly)
+    if (bedTime) {
+        def cron = "0 ${bedTime.split(':')[1]} ${bedTime.split(':')[0]} * * ?"  // e.g., "0 0 22 * * ?"
+        schedule(cron, enableBedtimeMode)
+    }
+    logDebug "Initialized"
 }
 
 def repeatedPollHumidity() {
@@ -139,6 +146,25 @@ def tempHandler(evt) {
     }
 }
 
+def startDrySession() {
+    logInfo "Starting Dry session"
+    state.dryActive = true
+    state.sessionStart = now()
+    state.inCooldown = false
+
+    mideaUnits.each { dev ->
+        dev.setThermostatMode("dry")
+        dev.on()
+        updateSetpoint(dev)
+        dev.setThermostatFanMode(state.fanMode ?: "auto")
+        logDebug "Configured ${dev.displayName}"
+        
+        if (useQuietNightMode && isBedtimeNow()) {  // Define helper
+            dev.setThermostatFanMode("silent")  // Assuming Midea supports; check driver [web:7][web:23]
+        }
+    }
+}
+
 def hourlySleepAdjust() {
     if (!state.dryActive || now() < state.bedTime) return  // Night-only
     def roomTemp = indoorTempSensor.currentValue("temperature")
@@ -152,26 +178,6 @@ def hourlySleepAdjust() {
     log.info "[MideaSmartDry] Sleep ramp: ${target}°C (room ${roomTemp}°C)"
 }
 
-def startDrySession() {
-    logInfo "Starting Dry session - humidity high"
-    state.dryActive = true
-    state.sessionStart = now()
-    state.inCooldown = false
-
-    mideaUnits.each { dev ->
-        dev.setThermostatMode("dry")
-        dev.on()
-        updateSetpoint(dev)
-        dev.setThermostatFanMode(fanMode)
-        setSwing(dev)
-        logDebug "Configured ${dev.displayName}"
-
-   if (useQuietNightMode) {
-          mideaUnits.each { dev ->
-              dev.setThermostatFanMode("silent")  // 1% quiet
-          }
-    }
-}
 
 def endDrySession() {
     logInfo "Ending Dry session - humidity low"
@@ -246,10 +252,32 @@ def calcAH(T, RH) {
 // Use: if (calcAH(indoorTemp, humidity) > 11) startDrySession()  
 
 def hoursSinceBedtime() {
-    def bedTimeMs = new Date().parse("yyyy-MM-dd'T'HH:mm:ssXXX", 
-    state.bedTime ?: "22:00:00"); 
-    return (now() - bedTimeMs.time) / 1000 / 60 / 60;
+    if (!bedTime) return 0
+    def nowTime = new Date()
+    def bedTimeDate = timeTodayAfter(new Date(), bedTime, location.timeZone)  // Fix parsing [web:27]
+    return (nowTime.time - bedTimeDate.time) / (1000 * 60 * 60)
+}
+
+private boolean isBedtimeNow() {
+    def nowTime = new Date()
+    def bedTimeDate = timeTodayAfter(new Date(), bedTime ?: "22:00", location.timeZone)
+    return nowTime.after(bedTimeDate)
 }
 
 private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
 private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
