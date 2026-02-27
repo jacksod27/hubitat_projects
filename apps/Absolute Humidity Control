@@ -116,17 +116,7 @@ def initialize() {
     logDebug "Initialized"
 }
 
-def repeatedPollHumidity() {
-    pollHumidity()
-    runIn((pollInterval * 60), repeatedPollHumidity)  // Use setting
-}
-
-def pollHumidity() {
-    logDebug "=== 30min POLL ==="
-    humiditySensor.refresh()
-    runIn(30, humidityHandler)  // Check 30sec after refresh
-}
-
+// HANDLER METHODS
 
 def humidityHandler(evt) {
     if (state.inCooldown) return
@@ -152,6 +142,8 @@ def bedtimeTrigger() {
     state.isBedtime = true
 }
 
+// CORE LOGIC 
+
 def startDrySession() {
     logInfo "Starting Dry session"
     state.dryActive = true
@@ -170,24 +162,6 @@ def startDrySession() {
         }
     }
 }
-
-def hourlySleepAdjust() {
-    if (!state.dryActive || !isBedtimeNow()) return
-    def roomTemp = indoorTempSensor.currentValue("temperature") ?: 25
-    def hum = humiditySensor.currentValue("humidity") ?: 50
-    def ah = calcAH(roomTemp, hum)
-    def hoursSince = hoursSinceBedtime()
-    def baseSet = state.currentSetpoint ?: 25
-    def targetTemp = baseSet + (hoursSince * 0.5)
-    if (ah > 11.5) targetTemp -= 0.5
-    
-    mideaUnits.each { dev ->
-        dev.setCoolingSetpoint(targetTemp.round())
-        dev.setThermostatFanMode("silent")
-    }
-    log.info "[MideaSmartDry] Sleep ramp: ${targetTemp.round()}°C (room ${roomTemp}°C, AH ${ah}g/m³)"
-}
-
 
 def endDrySession() {
     logInfo "Ending Dry session - humidity low"
@@ -220,6 +194,19 @@ def restoreUnits() {
             dev.on()
         }
     }
+}
+
+// TIMER METHODS
+
+def repeatedPollHumidity() {
+    pollHumidity()
+    runIn((pollInterval * 60), repeatedPollHumidity)  // Use setting
+}
+
+def pollHumidity() {
+    logDebug "=== 30min POLL ==="
+    humiditySensor.refresh()
+    runIn(30, humidityHandler)  // Check 30sec after refresh
 }
 
 def timerCheck() {
@@ -257,6 +244,25 @@ def cooldownEnd() {
     }
 }
 
+// FUNCTIONS
+
+def hourlySleepAdjust() {
+    if (!state.dryActive || !isBedtimeNow()) return
+    def roomTemp = indoorTempSensor.currentValue("temperature") ?: 25
+    def hum = humiditySensor.currentValue("humidity") ?: 50
+    def ah = calcAH(roomTemp, hum)
+    def hoursSince = hoursSinceBedtime()
+    def baseSet = state.currentSetpoint ?: 25
+    def targetTemp = baseSet + (hoursSince * 0.5)
+    if (ah > 11.5) targetTemp -= 0.5
+    
+    mideaUnits.each { dev ->
+        dev.setCoolingSetpoint(targetTemp.round())
+        dev.setThermostatFanMode("silent")
+    }
+    log.info "[MideaSmartDry] Sleep ramp: ${targetTemp.round()}°C (room ${roomTemp}°C, AH ${ah}g/m³)"
+}
+
 def calcAH(T, RH) {  
     def es = 6.112 * Math.exp((17.67 * T) / (T + 243.5))  
     def e = es * (RH / 100)  
@@ -278,6 +284,8 @@ private boolean isBedtimeNow() {
     def bedToday = timeTodayAfter(bedTime, location.timeZone)
     return nowTime.time >= bedToday.time
 }
+
+// LOGGING HELPERS
 
 private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
 private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
