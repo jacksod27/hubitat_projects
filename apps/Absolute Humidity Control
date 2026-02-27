@@ -118,18 +118,19 @@ def pollHumidity() {
     runIn(30, humidityHandler)  // Check 30sec after refresh
 }
 
+
 def humidityHandler(evt) {
     if (state.inCooldown) return
     def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
-    logDebug "Humidity: ${hum}%"
+    def roomT = indoorTempSensor.currentValue("temperature") ?: 25
+    def ah = calcAH(roomT, hum)
+    logDebug "RH: ${hum}%, AH: ${ah}g/m³"
 
-    if (!state.dryActive && hum > (highHumTrigger as Integer)) {
+    if (!state.dryActive && (hum > highHumTrigger || ah > 12)) {  // RH OR AH
         startDrySession()
-    } else if (state.dryActive && hum < (lowHumStop as Integer)) {
+    } else if (state.dryActive && hum < lowHumStop && ah < 9) {  // Both low
         endDrySession()
     }
-    
-    if (calcAH(indoorTempSensor.currentValue("temperature") ?: 25, hum) > 12) startDrySession();
 }
 
 def tempHandler(evt) {
@@ -137,8 +138,6 @@ def tempHandler(evt) {
         updateSetpoint()
     }
 }
-
-
 
 def hourlySleepAdjust() {
     if (!state.dryActive || now() < state.bedTime) return  // Night-only
