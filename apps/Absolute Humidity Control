@@ -116,8 +116,10 @@ def initialize() {
 
 def repeatedPollHumidity() {
     pollHumidity()
-    runIn(1800, repeatedPollHumidity)  // Chain next poll
+    runIn((pollInterval * 60), repeatedPollHumidity)  // Chain next poll
 }
+
+
 
 def pollHumidity() {
     logDebug "=== 30min POLL ==="
@@ -144,6 +146,11 @@ def tempHandler(evt) {
     if (state.dryActive) {
         updateSetpoint()
     }
+}
+
+def enableBedtimeMode() {
+    state.isBedtime = true
+    logDebug "Bedtime mode enabled"
 }
 
 def startDrySession() {
@@ -205,6 +212,7 @@ def restoreUnits() {
             dev.off()
         } else {
             dev.setThermostatMode(restoreMode)
+            dev.on()  // Ensure it runs
         }
     }
 }
@@ -254,14 +262,17 @@ def calcAH(T, RH) {
 def hoursSinceBedtime() {
     if (!bedTime) return 0
     def nowTime = new Date()
-    def bedTimeDate = timeTodayAfter(new Date(), bedTime, location.timeZone)  // Fix parsing [web:27]
-    return (nowTime.time - bedTimeDate.time) / (1000 * 60 * 60)
+    def bedToday = timeTodayAfter(bedTime, location.timeZone)  // Correct args [web:27]
+    def elapsed = nowTime.time - bedToday.time
+    return elapsed > 0 ? elapsed / (1000*60*60) : 0  // Avoid negative
 }
 
+
 private boolean isBedtimeNow() {
+    if (!bedTime) return false
     def nowTime = new Date()
-    def bedTimeDate = timeTodayAfter(new Date(), bedTime ?: "22:00", location.timeZone)
-    return nowTime.after(bedTimeDate)
+    def bedToday = timeTodayAfter(bedTime, location.timeZone)
+    return nowTime.time >= bedToday.time  // Current bedtime or after
 }
 
 private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
