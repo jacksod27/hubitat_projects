@@ -90,9 +90,6 @@ def updated() {
 }
 
 def initialize() {
-    state.dryActive = false
-    state.sessionStart = null
-    state.inCooldown = false
     state.currentSetpoint = null
     state.fanMode = "auto"  // Define missing vars
 
@@ -144,20 +141,6 @@ def minShutOffSeconds = 180    // 3 minutes
 
 
 // HANDLER METHODS
-
-def humidityHandler(evt) {
-    if (state.inCooldown) return
-    def hum = (humiditySensor.currentValue("humidity") ?: 0) as Integer
-    def roomT = indoorTempSensor.currentValue("temperature") ?: 25
-    def ah = calcAH(roomT, hum)
-    logDebug "RH: ${hum}%, AH: ${ah}g/m³"
-
-    if (!state.dryActive && (hum > highHumTrigger || ah > 12)) {  // RH OR AH
-        startDrySession()
-    } else if (state.dryActive && hum < lowHumStop && ah < 9) {  // Both low
-        endDrySession()
-    }
-}
 
 def tempHandler(evt) {
     if (state.dryActive) {
@@ -326,172 +309,6 @@ def acHandlerCycled() {
     }
 }
 
-
-def acHandler() {
-    def inputs = [
-        temp:     safeValue(indoorTempSensor, "temperature"),
-        humidity: safeValue(humiditySensor, "humidity"),
-        // windSpeed: ... if you map it later, unused for now
-    ]
-
-    def feelsLike = calcFeelsLike(inputs.temp, inputs.humidity)
-
-    def midea = mideaThermostat  // your Midea thermostat device from tomwpublic driver
-    def currentMode = midea.currentValue("thermostatMode") ?: "off"
-    def currentSetpoint = safeValue(midea, "coolingSetpoint") ?: inputs.temp
-    def now = new Date()
-    def isEveningOrNight = (now.format("H", location.timeZone) as Integer) >= 18 ||
-                          (now.format("H", location.timeZone) as Integer) <= 6
-
-    // Key comfort band
-    def tooColdFeeling = feelsLike != null && feelsLike < 21.0
-    def tooHotFeeling  = feelsLike != null && feelsLike > 24.0
-    def withinComfort = !tooColdFeeling && !tooHotFeeling
-
-    def decision = [
-        turnOn:      false,
-        turnOff:     false,
-        setMode:     null,
-        setSetpoint: null,
-        setFan:      isEveningOrNight ? "silent" : "auto",
-        reason:      ""
-    ]
-
-    // 1. RH ≥ 60% → always Dry mode, 24–26 °C
-    if (inputs.humidity >= 60.0) {
-        decision.setMode = "dry"
-        decision.setSetpoint = Math.max(24.0, Math.min(26.0, inputs.temp))
-        decision.setFan = "auto"        // Dry mode; fan is fixed, not "silent"
-        decision.turnOn = true
-        decision.reason = "RH ≥ 60%, using Dry mode 24–26 °C"
-    }
-    // 2. Temp > 26 °C → Cool down to 24–26 °C
-    else if (inputs.temp > 26.0) {
-        decision.setMode = "cool"
-        def target = Math.max(24.0, Math.min(26.0, inputs.temp))
-        def delta = Math.abs(target - currentSetpoint)
-
-        // 1 °C max change per adjustment window (you control timing via schedule/runIn elsewhere)
-        def maxAllowedChange = 1.0
-        def nextSetpoint = currentSetpoint
-        if (target < currentSetpoint && delta > 0.5) {
-            nextSetpoint = Math.max(target, currentSetpoint - maxAllowedChange)
-        } else if (target > currentSetpoint && delta > 0.5) {
-            nextSetpoint = Math.min(target, currentSetpoint + maxAllowedChange)
-        }
-
-        decision.setSetpoint = nextSetpoint.round(1)
-        decision.setFan = isEveningOrNight ? "silent" : "auto"
-        decision.turnOn = true
-        decision.reason = "Temp > 26 °C, cooling to 24–26 °C"
-    }
-    // 3. Feels‑like too hot but temp ≤ 26 °C → Dry or Cool
-    else if (tooHotFeeling && inputs.temp <= 26.0) {
-        if (inputs.humidity > 55.0) {
-            decision.setMode = "dry"
-            decision.setSetpoint = Math.max(24.0, Math.min(26.0, inputs.temp))
-            decision.setFan = "auto"
-            decision.turnOn = true
-            decision.reason = "Feels‑like hot, humidity > 55%, using Dry 24–26 °C"
-        } else {
-            decision.setMode = "cool"
-            decision.setSetpoint = Math.max(24.0, inputs.temp).round(1)
-            decision.setFan = isEveningOrNight ? "silent" : "auto"
-            decision.turnOn = true
-            decision.reason = "Feels‑like hot, using Cool to ~24 °C"
-        }
-    }
-    // 4. Temp < 20 °C → Heat to 21 °C
-    else if (inputs.temp < 20.0) {
-        decision.setMode = "heat"
-        decision.setSetpoint = 21.0
-        decision.setFan = isEveningOrNight ? "silent" : "auto"
-        decision.turnOn = true
-        decision.reason = "Temp < 20 °C, heating to 21 °C"
-    }
-    // 5. Feels‑like too cold but temp ≥ 20 °C → Fan only if desired, else off
-    else if (tooColdFeeling && inputs.temp >= 20.0) {
-        decision.setMode = "fan"        // or "off" if you prefer no fan here
-        decision.setFan = "auto"
-        decision.turnOn = true
-        decision.reason = "Feels‑like cold, temp ≥ 20 °C, using Fan only"
-    }
-    // 6. Feels‑like comfortable → keep off or fan‑only
-    else if (withinComfort) {
-        decision.setMode = "off"
-        decision.reason = "Feels‑like in 21–24 °C, no AC needed"
-        decision.turnOff = true
-    }
-    // 7. Ambient temp ok but feels‑like slightly hot → mild Cool or Dry
-    else if (tooHotFeeling && inputs.temp > 24.5) {
-        decision.setMode = "cool"
-        decision.setSetpoint = Math.max(24.0, inputs.temp - 0.5).round(1)
-        decision.setFan = isEveningOrNight ? "silent" : "auto"
-        decision.turnOn = true
-        decision.reason = "Feels‑like hot, mild cooling to ${decision.setSetpoint} °C"
-    }
-
-    // 8. Fan mode: only when in Cool/Heat; Dry and Fan modes clamp to their own rules
-    if (decision.setMode == "dry") {
-        decision.setFan = "auto"        // Midea Dry mode fan is handled by device
-    } else if (decision.setMode in ["cool", "heat"]) {
-        decision.setFan = isEveningOrNight ? "silent" : "auto"
-    } else {
-        decision.setFan = "auto"        // off / fan only
-    }
-
-    // 9. Apply decisions to Midea thermostat
-    def currentState = midea.currentValue("switch") ?: "off"
-
-    log.info "[ACRule] Decision: ${decision.setMode} / ${decision.setSetpoint} °C / ${decision.setFan}  → ${decision.reason}"
-
-    if (decision.turnOn && currentState == "off") {
-        midea.on()
-        pause(500)
-    }
-    if (decision.setMode && currentMode != decision.setMode) {
-        midea.setThermostatMode(decision.setMode)
-        pause(500)
-    }
-    if (decision.setSetpoint != null) {
-        midea.setCoolingSetpoint(decision.setSetpoint)  // for Midea both cooling/heating setpoints are equivalent
-        pause(500)
-    }
-    if (decision.setFan && ["cool", "heat"].contains(decision.setMode)) {
-        midea.setThermostatFanMode(decision.setFan)   // “silent” / “auto” handled by driver
-        pause(500)
-    }
-    if (decision.turnOff && currentState == "on") {
-        midea.off()
-    }
-}
-
-
-def startDrySession() {
-    logInfo "Starting Dry session"
-    state.dryActive = true
-    state.sessionStart = now()
-    state.inCooldown = false
-
-    mideaUnits.each { dev ->
-        dev.setThermostatMode("dry")
-        dev.on()
-        updateSetpoint(dev)
-        dev.setThermostatFanMode(state.fanMode ?: "auto")
-        logDebug "Configured ${dev.displayName}"
-        
-        if (useQuietNightMode && isBedtimeNow()) {  // Define helper
-            dev.setThermostatFanMode("silent")  // Assuming Midea supports; check driver [web:7][web:23]
-        }
-    }
-}
-
-def endDrySession() {
-    logInfo "Ending Dry session - humidity low"
-    state.dryActive = false
-    restoreUnits()
-}
-
 def updateSetpoint(dev=null) {
     def outdoorTemp = outdoorTempSensor.currentValue("temperature") ?: 25
     def setpoint = Math.max(minTemp, Math.min(maxTemp, Math.round(outdoorTemp)))
@@ -649,39 +466,11 @@ def pollHumidity() {
     runIn(30, humidityHandler)  // Check 30sec after refresh
 }
 
-def timerCheck() {
-    if (!state.dryActive || !state.sessionStart) {
-        runIn(60, timerCheck)  // Fixed: use runIn instead of schedule
-        return
-    }
-
-    def runMins = (now() - state.sessionStart) / 1000 / 60
-    if (runMins >= (maxRunTime as Integer)) {
-        logInfo "Max run time reached (${runMins}min)"
-        forceEndDry()
-    } else {
-        runIn(60, timerCheck)  // Check again in 1 minute
-    }
-}
-
 def forceEndDry() {
     state.dryActive = false
     restoreUnits()
     state.inCooldown = true
     runIn((cooldownTime * 60), cooldownEnd)
-}
-
-def cooldownEnd() {
-    state.inCooldown = false
-    def hum = humiditySensor.currentValue("humidity") ?: 0
-    def roomT = indoorTempSensor.currentValue("temperature") ?: 25
-    def ah = calcAH(roomT, hum)
-    if (hum > restartHum || ah > 11) {
-        logInfo "Cooldown end - RH ${hum}%/AH ${ah}g, restarting Dry"
-        startDrySession()
-    } else {
-        logInfo "Cooldown end - OK, continue monitoring"
-    }
 }
 
 def elapsedTime(now, then) {
