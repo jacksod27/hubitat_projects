@@ -316,6 +316,11 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         reason:      ""
     ]
 
+    if (temp == null || rh == null) {
+        decision.reason = "Missing temp or humidity; no action"
+        return decision
+    }
+
     def isEveningOrNight = (now.format("H", location.timeZone) as Integer) >= 18 ||
                            (now.format("H", location.timeZone) as Integer) <= 6
     decision.setFan = isEveningOrNight ? "silent" : "auto"
@@ -377,52 +382,6 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
     }
     // 6. Feels‑like too cold but temp ≥ 20 °C → Fan only
     else if (tooColdFeeling && temp >= 20.0
-
-// FUNCTIONS
-
-def hourlySleepAdjust() {
-    if (!state.dryActive || !isBedtimeNow()) return
-    def roomTemp = indoorTempSensor.currentValue("temperature") ?: 25
-    def hum = humiditySensor.currentValue("humidity") ?: 50
-    def ah = calcAH(roomTemp, hum)
-    def hoursSince = hoursSinceBedtime()
-    def baseSet = state.currentSetpoint ?: 25
-    def targetTemp = baseSet + (hoursSince * 0.5)
-    if (ah > 11.5) targetTemp -= 0.5
-    
-    mideaUnits.each { dev ->
-        dev.setCoolingSetpoint(targetTemp.round())
-        dev.setThermostatFanMode("silent")
-    }
-    log.info "[MideaSmartDry] Sleep ramp: ${targetTemp.round()}°C (room ${roomTemp}°C, AH ${ah}g/m³)"
-}
-
-def calcAH(T, RH) {  
-    def es = 6.112 * Math.exp((17.67 * T) / (T + 243.5))  
-    def e = es * (RH / 100)  
-    return (e * 100 * 2.16679) / (T + 273.15)  
-}  
-// Use: if (calcAH(indoorTemp, humidity) > 11) startDrySession()  
-
-def hoursSinceBedtime() {
-    if (!bedTime) return 0
-    def nowTime = new Date()
-    def bedToday = timeTodayAfter(bedTime, location.timeZone)
-    def elapsed = nowTime.time - bedToday.time
-    return Math.max(0, elapsed / (1000 * 60 * 60))  // Floor to hours, no negative
-}
-
-private boolean isBedtimeNow() {
-    if (!bedTime) return false
-    def nowTime = new Date()
-    def bedToday = timeTodayAfter(bedTime, location.timeZone)
-    return nowTime.time >= bedToday.time
-}
-
-// LOGGING HELPERS
-
-private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
-private logInfo(msg) { log.info "[MideaSmartDry] ${msg}" }
 
 
 
