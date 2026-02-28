@@ -1,5 +1,5 @@
 /**
- * Midea AC Smart Night Heating (Hubitat Elevation)
+ * Midea AC Smart Temperature (Hubitat Elevation)
  * Midea AC via hubitat_midea driver + temperature sensor.
  *
  * After 9 pm:
