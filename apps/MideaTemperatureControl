@@ -1,8 +1,10 @@
 /**
- * Midea AC Smart Temperature (Hubitat Elevation)
- * Midea AC via hubitat_midea driver + temperature sensor.
+ * Midea AC Temperature Manager (Hubitat Elevation)
+ * Uses hubitat_midea‑driven Midea AC + one temperature sensor.
  *
- * After 9 pm:
+ * Day Cooling:   >28°C → Auto, cooling setpoint 26°C
+ * Night Heating: if today max temp < 22°C:
+ *  After 9 pm:
  * - fan → silent (if supported)
  * - gradually lower AC heating setpoint by 1°C at a time
  *   such that:
@@ -10,11 +12,11 @@
  *   - setpoint changes ~1–2°C per hour (via 30‑minute tick)
  */
 definition(
-    name: "Midea Smart Night Heating",
+    name: "Midea Room Temperature Manager",
     namespace: "perplexity",
     author: "Perplexity",
-    description: "Gradual night heating for Midea AC; 1°C steps, 1–2°C/hour.",
-    category: "Convenience",
+    description: "Manages Midea AC via hubitat_midea integration.",
+    category: "Climate Control",
     iconUrl: "",
     iconX2Url: "",
     singleInstance: true
