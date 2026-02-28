@@ -14,7 +14,11 @@ definition(
 )
 
 preferences {
-    page(name: "mainPage")
+    page(name: "mainPage", title: "", install: true, uninstall: true) {
+        section("App Name") {
+            label title: "Customize installed app name (optional):", required: false
+        }
+    }
 }
 
 def mainPage() {
