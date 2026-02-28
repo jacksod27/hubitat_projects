@@ -185,10 +185,14 @@ def acHandlerCycled() {
 
     // 4. Apply cycle limits per device
     mideaUnits?.each { midea ->
+        def skipApply = false
         def currentState = midea.currentValue("switch") ?: "off"
         def currentMode  = midea.currentValue("thermostatMode") ?: "off"
 
         // 4a. Dry mode rules
+        if (currentMode == DRY_MODE) {
+            if (elapsedMin >= maxDryMinutes) {
+
         if (currentMode == DRY_MODE) {
             if (elapsedMin >= maxDryMinutes) {
                 logInfo "Dry mode max ${maxDryMinutes}min reached; off + 30min fan"
@@ -223,6 +227,7 @@ def acHandlerCycled() {
                     decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
                     decision.setFan = "auto"
                 }
+            skipApply = true
             }
         }
 
@@ -306,6 +311,7 @@ def acHandlerCycled() {
 
 
 // MODE / SETPOINT LOGIC (Feels‑like + AH)
+
 def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
     def decision = [
         turnOn:      false,
@@ -315,6 +321,11 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         setFan:      null,
         reason:      ""
     ]
+
+     // 5. Feels‑like comfort band
+    def tooColdFeeling = feelsLike != null && feelsLike < 21.0
+    def tooHotFeeling  = feelsLike != null && feelsLike > 24.0
+    def withinComfort = !tooColdFeeling && !tooHotFeeling
 
     // 1. Guard against null sensors
     if (temp == null || rh == null) {
@@ -333,7 +344,7 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
         decision.setFan = "auto"
         decision.turnOn = true
-        decision.reason = "AH ${ah.round(1)}g/m³ or RH ≥ 59%; Dry 24–26 °C"
+        decision.reason = "AH ${ah?.round(1)}g/m³ or RH ≥ 59%; Dry 24–26 °C"
     }
     // 4. Temp > 26 °C → Cool to 24–26 °C
     else if (temp > 26.0) {
@@ -354,13 +365,8 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         decision.reason = "Temp > 26 °C; cooling to 24–26 °C"
     }
 
-    // 5. Feels‑like comfort band
-    def tooColdFeeling = feelsLike != null && feelsLike < 21.0
-    def tooHotFeeling  = feelsLike != null && feelsLike > 24.0
-    def withinComfort = !tooColdFeeling && !tooHotFeeling
-
     // 6. Feels‑like hot but temp ≤ 26 °C → Dry or Cool
-    if (tooHotFeeling && temp <= 26.0) {
+    else if (tooHotFeeling && temp <= 26.0) {
         if (rh > 55.0) {
             decision.setMode = DRY_MODE
             decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
