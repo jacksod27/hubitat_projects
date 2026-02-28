@@ -610,8 +610,7 @@ def acHandlerCycled() {
     }
 }
 
-// FEELS‑LIKE / MODE LOGIC
-
+// MODE / SETPOINT LOGIC (Feels‑like + AH)
 def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
     def decision = [
         turnOn:      false,
@@ -622,24 +621,26 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         reason:      ""
     ]
 
+    // 1. Guard against null sensors
     if (temp == null || rh == null) {
         decision.reason = "Missing temp or humidity; no action"
         return decision
     }
 
+    // 2. Determine evening/night for fan mode
     def isEveningOrNight = (now.format("H", location.timeZone) as Integer) >= 18 ||
                            (now.format("H", location.timeZone) as Integer) <= 6
     decision.setFan = isEveningOrNight ? "silent" : "auto"
 
-    // 1. If AH too high (≥12 g/m³) OR RH ≥ 60 → Dry mode, 24–26 °C
+    // 3. AH too high (≥11.5 g/m³) OR RH ≥ 59 → Dry mode, 24–26 °C
     if ((ah && ah >= 11.5) || (rh && rh >= 59.0)) {
         decision.setMode = DRY_MODE
         decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
         decision.setFan = "auto"
         decision.turnOn = true
-        decision.reason = "AH ${ah?.round(1)}g/m³ or RH ≥ 60%; using Dry 24–26 °C"
+        decision.reason = "AH ${ah.round(1)}g/m³ or RH ≥ 59%; Dry 24–26 °C"
     }
-    // 2. Temp > 26 °C → Cool to 24–26 °C
+    // 4. Temp > 26 °C → Cool to 24–26 °C
     else if (temp > 26.0) {
         decision.setMode = COOL_MODE
         def target = Math.max(24.0, Math.min(26.0, temp))
@@ -657,28 +658,29 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         decision.turnOn = true
         decision.reason = "Temp > 26 °C; cooling to 24–26 °C"
     }
-    // 3. Comfort / feels‑like checks
+
+    // 5. Feels‑like comfort band
     def tooColdFeeling = feelsLike != null && feelsLike < 21.0
     def tooHotFeeling  = feelsLike != null && feelsLike > 24.0
     def withinComfort = !tooColdFeeling && !tooHotFeeling
 
-    // 4. Feels‑like hot but temp ≤ 26 °C → Dry or Cool
+    // 6. Feels‑like hot but temp ≤ 26 °C → Dry or Cool
     if (tooHotFeeling && temp <= 26.0) {
         if (rh > 55.0) {
             decision.setMode = DRY_MODE
             decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
             decision.setFan = "auto"
             decision.turnOn = true
-            decision.reason = "Feels‑like hot, RH > 55%; using Dry 24–26 °C"
+            decision.reason = "Feels‑like hot, RH > 55%; Dry 24–26 °C"
         } else {
             decision.setMode = COOL_MODE
             decision.setSetpoint = Math.max(24.0, temp).round(1)
             decision.setFan = isEveningOrNight ? "silent" : "auto"
             decision.turnOn = true
-            decision.reason = "Feels‑like hot; use Cool to ~24 °C"
+            decision.reason = "Feels‑like hot; Cool to ~24 °C"
         }
     }
-    // 5. Temp < 20 °C → Heat to 21 °C
+    // 7. Temp < 20 °C → Heat to 21 °C
     else if (temp < 20.0) {
         decision.setMode = HEAT_MODE
         decision.setSetpoint = 21.0
@@ -686,11 +688,38 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
         decision.turnOn = true
         decision.reason = "Temp < 20 °C; heat to 21 °C"
     }
-    // 6. Feels‑like too cold but temp ≥ 20 °C → Fan only
-    else if (tooColdFeeling && temp >= 20.0
+    // 8. Feels‑like too cold but temp ≥ 20 °C → Fan only
+    else if (tooColdFeeling && temp >= 20.0) {
+        decision.setMode = FAN_MODE
+        decision.setFan = "auto"
+        decision.turnOn = true
+        decision.reason = "Feels‑like cold, temp ≥ 20 °C; using Fan only"
+    }
+    // 9. Feels‑like comfortable
+    else if (withinComfort) {
+        decision.setMode = "off"
+        decision.turnOff = true
+        decision.reason = "Feels‑like in 21–24 °C; no AC needed"
+    }
+    // 10. Ambient temp OK but feels‑like slightly hot
+    else if (tooHotFeeling && temp > 24.5) {
+        decision.setMode = COOL_MODE
+        decision.setSetpoint = Math.max(24.0, temp - 0.5).round(1)
+        decision.setFan = isEveningOrNight ? "silent" : "auto"
+        decision.turnOn = true
+        decision.reason = "Feels‑like hot, mild cooling to ${decision.setSetpoint} °C"
+    }
 
+    // 11. Clamp Dry mode setpoint to 24–26 °C
+    if (decision.setMode == DRY_MODE) {
+        decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
+        decision.setFan = "auto"
+    }
 
+    return decision
+}
 
+// LOGGING HELPERS
 
-
-
+private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartDry] ${msg}" }
+private logInfo(msg)  { log.info "[MideaSmartDry] ${msg}" }
