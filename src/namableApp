@@ -1,0 +1,8 @@
+preferences {
+    page(name: "mainPage", title: "", install: true, uninstall: true) {
+        section("App Name") {
+            label title: "Customize installed app name (optional):", required: false
+        }
+        // ... your existing sections and inputs here ...
+    }
+}
