@@ -304,6 +304,312 @@ def acHandlerCycled() {
     }
 }
 
+/*
+ * Midea Smart Control
+ *
+ * Version with:
+ * - Feels like and more
+ * - 24-26C setpoint logic based on outdoor temp
+ * - Polls humidity every 30min
+ * - Max 1.5hr run time, then 30min cooldown
+ * - Restart if humidity >60% after cooldown
+ * - Utilises Absolute Humidity to determine dry mode over night
+ * - Can operate silently over night
+ */
+
+definition(
+    name: "Midea Smart  Control",
+    namespace: "custom.midea",
+    author: "Jacksod27 + Perplexity",
+    description: "Smart  control for Midea AC with temp setpoint, timers, feels like, absolute humidity dry mode, short cycling controls",
+    category: "Climate Control",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Midea Smart Control (Option B)", install: true, uninstall: true) {
+        section("Sensors") {
+            input "humiditySensor", "capability.relativeHumidityMeasurement",
+                title: "Humidity sensor", required: true
+            input "outdoorTempSensor", "capability.temperatureMeasurement",
+                title: "Outdoor temperature sensor (Celsius)", required: true
+            input "indoorTempSensor", "capability.temperatureMeasurement",
+                title: "Indoor temperature sensor", required: true
+        }
+        section("Midea AC units") {
+            input "mideaUnits", "capability.thermostat",
+                title: "Midea AC devices", required: true, multiple: true
+        }
+        section("Setpoints & Thresholds") {
+            input "minTemp", "number", title: "Min setpoint (C)",
+                defaultValue: 24, required: true
+            input "maxTemp", "number", title: "Max setpoint (C)",
+                defaultValue: 26, required: true
+        }
+        section("BedTime") {
+            input "bedTime", "time", title: "Bedtime (for quiet mode)"
+        }
+        section("Options") {
+            input "enableLogging", "bool", title: "Enable debug logging",
+                defaultValue: true
+            input "useQuietNightMode", "bool", title: "Enable Silent Night Mode (Silent fan at bedtime)",
+                defaultValue: false
+        }
+    }
+}
+
+def installed() {
+    logDebug "Installed"
+    initialize()
+}
+
+def updated() {
+    logDebug "Updated"
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    state.lastOn = 0          // epoch ms
+    state.lastOff = 0         // epoch ms
+    state.sessionStart = 0    // now() when current mode started
+    state.modeAtStart = null  // to know if we're in Dry+cooldown
+    state.currentSetpoint = null
+    state.fanMode = "auto"
+
+    // Listen to indoor temp + humidity changes
+    subscribe(indoorTempSensor, "temperature", tempHandler)
+    subscribe(humiditySensor, "humidity", humidityHandler)
+    subscribe(outdoorTempSensor, "temperature", tempHandler)
+
+    // Optional: periodic sweep in case sensors stall
+    runEvery5Minutes(acHandlerCycled)
+
+    if (useQuietNightMode && bedTime) {
+        def parts = bedTime.split(':')
+        if (parts.size() == 2) {
+            def cron = "0 ${parts[1].padLeft(2,'0')} ${parts[0].padLeft(2,'0')} * * ?"
+            schedule(cron, bedtimeTrigger)
+        }
+    }
+}
+
+// HELPERS
+
+def calcAH(T, RH) {
+    def es = 6.112 * Math.exp((17.67 * T) / (T + 243.5))
+    def e = es * (RH / 100)
+    return (e * 100 * 2.16679) / (T + 273.15)
+}
+
+def calcFeelsLike(tempC, rh) {
+    if (tempC == null || rh == null) return null
+    def humBonus = Math.max(0, rh - 50) * 0.05   // ~+0.5 °C per 10 % beyond 50 %
+    return (tempC + humBonus).round(1)
+}
+
+def safeValue(device, attr) {
+    def v = device?.currentValue(attr)
+    return v ? new BigDecimal(v.toString()) : null
+}
+
+def elapsedTime(now, then) {
+    then ? (now - then) / 1000 : 0
+}
+
+// STATES (for cycles)
+
+def DRY_MODE = "dry"
+def COOL_MODE = "cool"
+def HEAT_MODE = "heat"
+def FAN_MODE = "fan"
+
+def maxDryMinutes = 90
+def maxHeatCoolMinutes = 120
+def cooldownMinutes = 30
+def minShutOffSeconds = 180    // 3 minutes
+
+// EVENTS (triggers acHandlerCycled)
+
+def humidityHandler(evt) {
+    logDebug "Humidity changed: ${evt.value}%"
+    acHandlerCycled()
+}
+
+def tempHandler(evt) {
+    logDebug "Temp changed: ${evt.value}°C"
+    acHandlerCycled()
+}
+
+def bedtimeTrigger() {
+    logDebug "Bedtime triggered"
+    state.isBedtime = true
+}
+
+// MAIN CONTROL
+
+def acHandlerCycled() {
+    def temp   = safeValue(indoorTempSensor, "temperature")
+    def rh     = safeValue(humiditySensor, "humidity")
+    def outT   = safeValue(outdoorTempSensor, "temperature") ?: 25
+    def feelsLike = calcFeelsLike(temp, rh)
+
+    def ah = rh && temp ? calcAH(temp, rh) : null
+
+    def now = now()
+
+    def lastOn = state.lastOn ?: 0
+    def lastOff = state.lastOff ?: 0
+    def sessionStart = state.sessionStart ?: 0
+    def modeAtStart = state.modeAtStart ?: null
+
+    def elapsedSec = (now - sessionStart) / 1000
+    def elapsedMin = elapsedSec / 60
+
+    // 1. If any Midea unit was turned off less than 3 min ago, block all restarts
+    if (lastOff > 0) {
+        def secondsSinceOff = (now - lastOff) / 1000
+        if (secondsSinceOff < minShutOffSeconds) {
+            logDebug "Block restart: last off ${secondsSinceOff.round(1)}s ago < 3 min"
+            return
+        }
+    }
+
+    // 2. Compute setpoint from outdoor temp (24–26 °C band)
+    def setpoint = Math.max(minTemp, Math.min(maxTemp, Math.round(outT)))
+    state.currentSetpoint = setpoint
+
+    // 3. Decide mode + setpoint + fan from feels‑like + AH
+    def decision = makeDecision(temp, rh, ah, feelsLike, setpoint, now)
+
+    // 4. Apply cycle limits per device
+    mideaUnits?.each { midea ->
+        def currentState = midea.currentValue("switch") ?: "off"
+        def currentMode  = midea.currentValue("thermostatMode") ?: "off"
+
+        // 4a. Dry mode rules
+        if (currentMode == DRY_MODE) {
+            if (elapsedMin >= maxDryMinutes) {
+                logInfo "Dry mode max ${maxDryMinutes}min reached; off + 30min fan"
+                midea.off()
+                pause(500)
+                midea.setThermostatMode(FAN_MODE)
+                pause(500)
+                midea.on()
+                state.sessionStart = now
+                state.modeAtStart = FAN_MODE
+                state.lastOff = 0
+                return
+            }
+
+            if (ah != null) {
+                def ahLow  = 9.0  // desire 9–11 g/m³
+                def ahHigh = 11.0
+                if (ah < ahLow) {
+                    logInfo "AH ${ah.round(1)}g/m³ too low; stop Dry, 30min fan cooldown"
+                    midea.off()
+                    pause(500)
+                    midea.setThermostatMode(FAN_MODE)
+                    pause(500)
+                    midea.on()
+                    state.sessionStart = now
+                    state.modeAtStart = FAN_MODE
+                    state.lastOff = 0
+                    return
+                } else if (ah > 12.0 && decision.setMode != DRY_MODE) {
+                    logInfo "AH ${ah.round(1)}g/m³ too high; flag Dry restart after cooldown"
+                    decision.setMode = DRY_MODE
+                    decision.setSetpoint = Math.max(24.0, Math.min(26.0, temp))
+                    decision.setFan = "auto"
+                }
+            }
+        }
+
+        // 4b. Fan cooldown after Dry
+        if (modeAtStart == DRY_MODE && currentState == "on" && currentMode == FAN_MODE) {
+            if (elapsedMin >= cooldownMinutes) {
+                logInfo "Dry+fan cooldown complete; normal control resumes"
+                state.sessionStart = 0
+                state.modeAtStart = null
+            } else {
+                logDebug "In 30min fan cooldown after Dry; not overriding"
+                return
+            }
+        }
+
+        // 4c. Heat/Cool max 2h, 30min cooldown after >50% of max run
+        if (currentMode in [COOL_MODE, HEAT_MODE]) {
+            if (elapsedMin >= maxHeatCoolMinutes) {
+                logInfo "${currentMode.toUpperCase()} max ${maxHeatCoolMinutes}min reached; turning off"
+                midea.off()
+                pause(500)
+                state.sessionStart = 0
+                state.modeAtStart = null
+                state.lastOff = now
+                return
+            }
+
+            def halfMax = maxHeatCoolMinutes / 2
+            if (elapsedMin > halfMax && decision.turnOff) {
+                def lastOnElapsed = elapsedTime(now, state.lastOn)
+                if (lastOnElapsed > halfMax * 60) {
+                    logInfo "${currentMode.toUpperCase()} ran >50% max; enforce 30min cooldown"
+                    midea.off()
+                    pause(500)
+                    state.sessionStart = 0
+                    state.modeAtStart = null
+                    state.lastOff = now
+                    return
+                }
+            }
+        }
+
+        // 4d. If we’re in cooldown, don’t restart
+        if (currentState == "off" && lastOff > 0) {
+            def secondsSinceOff = (now - lastOff) / 1000
+            if (secondsSinceOff < (cooldownMinutes * 60)) {
+                logDebug "Cooldown ${secondsSinceOff / 60} min remaining; not restarting"
+                return
+            }
+        }
+
+        // 5. Apply decision only if allowed
+        if (decision.turnOff && currentState == "on") {
+            midea.off()
+            state.lastOff = now
+            state.sessionStart = 0
+            state.modeAtStart = null
+        } else if (decision.turnOn && currentState == "off") {
+            midea.on()
+            state.lastOn = now
+            if (decision.setMode) {
+                state.sessionStart = now
+                state.modeAtStart = decision.setMode
+            }
+        }
+
+        if (decision.setMode && currentMode != decision.setMode) {
+            midea.setThermostatMode(decision.setMode)
+            pause(500)
+        }
+        if (decision.setSetpoint != null) {
+            midea.setCoolingSetpoint(decision.setSetpoint)
+            pause(500)
+        }
+        if (decision.setFan && ["cool", "heat"].contains(decision.setMode)) {
+            midea.setThermostatFanMode(decision.setFan)
+            pause(500)
+        }
+    }
+}
+
 // FEELS‑LIKE / MODE LOGIC
 
 def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
@@ -382,6 +688,9 @@ def makeDecision(temp, rh, ah, feelsLike, setpoint, now) {
     }
     // 6. Feels‑like too cold but temp ≥ 20 °C → Fan only
     else if (tooColdFeeling && temp >= 20.0
+
+
+
 
 
 
