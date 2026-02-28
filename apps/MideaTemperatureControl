@@ -1,0 +1,176 @@
+/**
+ * Midea AC Temperature Manager (Hubitat Elevation)
+ * Uses hubitat_midea‑driven Midea AC + one temperature sensor.
+ *
+ * Day Cooling:   >28°C → Auto, cooling setpoint 26°C
+ * Night Heating: if today max temp < 22°C:
+ *   - evening: heat 22°C, fan auto
+ *   - after 21:00: fan → "silent" (if supported), then drop 1°C at a time
+ *     down to 15°C (display) but never below 16°C setpoint.
+ */
+definition(
+    name: "Midea Room Temperature Manager",
+    namespace: "perplexity",
+    author: "Perplexity",
+    description: "Manages Midea AC via hubitat_midea integration.",
+    category: "Convenience",
+    iconUrl: "",
+    iconX2Url: "",
+    singleInstance: true
+)
+
+preferences {
+    page(name: "mainPage")
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Midea Temperature Manager", install: true, uninstall: true) {
+        section("Devices") {
+            input "tempSensor", "capability.temperatureMeasurement", title: "Temperature Sensor", multiple: false, required: true
+            input "mideaThermostat", "capability.thermostat", title: "Midea AC (hubitat_midea driver)", multiple: false, required: true
+        }
+        section("Day Cooling Settings") {
+            input "coolThreshold", "decimal", title: "Cooling ON when room temp > (°C)", defaultValue: 28.0
+            input "coolSetpoint", "decimal", title: "Cooling setpoint (°C)", defaultValue: 26.0
+        }
+        section("Night Heating Settings") {
+            input "heatMaxDayTemp", "decimal", title: "Max day temp threshold (°C) to enable night heating", defaultValue: 22.0
+            input "nightStartHour", "number", title: "Evening heating start hour (24h)", defaultValue: 18)
+            input "silentFanHour", "number", title: "Switch fan to silent after (hour)", defaultValue: 21)
+            input "minDisplayTemp", "decimal", title: "Minimum display temperature (°C)", defaultValue: 15.0
+            input "minHeatingSetpoint", "decimal", title: "Minimum AC heating setpoint (°C)", defaultValue: 16.0
+        }
+    }
+}
+
+def installed() {
+    log.debug "Installed: ${settings}"
+    initialize()
+}
+
+def updated() {
+    log.debug "Updated: ${settings}"
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    subscribe(tempSensor, "temperature", handleTemp)
+    runEvery15Minutes(updateDayMaxTemp)
+    schedule("${nightStartHour} 0 0 * * ?", startNightHeating)
+    schedule("${silentFanHour} 0 0 * * ?", setFanSilent)
+}
+
+// --------- Day Cooling Logic --------- //
+def handleTemp(evt) {
+    BigDecimal currentTemp = evt.value as BigDecimal
+    String currentMode = mideaThermostat.currentValue("thermostatMode")
+    BigDecimal currentCoolSp = mideaThermostat.currentValue("coolingSetpoint") as BigDecimal
+
+    if (currentTemp > coolThreshold) {
+        if (currentMode != "auto") {
+            mideaThermostat.setThermostatMode("auto")
+            mideaThermostat.setCoolingSetpoint(coolSetpoint)
+            log.debug "Day Cooling: temp=${currentTemp} > ${coolThreshold}, Midea → Auto, coolSp=${coolSetpoint}"
+        } else if (currentCoolSp != coolSetpoint) {
+            mideaThermostat.setCoolingSetpoint(coolSetpoint)
+        }
+    }
+}
+
+// Simple rolling max temp for today
+def updateDayMaxTemp() {
+    BigDecimal current = tempSensor.currentValue("temperature") as BigDecimal
+    state.maxTempToday = state.maxTempToday
+        ? Math.max(state.maxTempToday, current)
+        : current
+}
+
+def wouldDoNightHeating() {
+    BigDecimal max = state.maxTempToday ?: 0.0
+    return max < heatMaxDayTemp
+}
+
+// --------- Night Heating Logic --------- //
+def startNightHeating() {
+    if (!wouldDoNightHeating()) {
+        log.debug "Max temp today (${state.maxTempToday}) ≥ ${heatMaxDayTemp}; skipping night heating"
+        return
+    }
+
+    BigDecimal currentTemp = tempSensor.currentValue("temperature") as BigDecimal
+    String currentMode = mideaThermostat.currentValue("thermostatMode")
+    String currentFan = mideaThermostat.currentValue("thermostatFanMode")
+
+    if (currentMode != "heat") {
+        mideaThermostat.setThermostatMode("heat")
+        mideaThermostat.setHeatingSetpoint(22.0)
+        if (currentFan != "auto") {
+            mideaThermostat.setThermostatFanMode("auto")
+        }
+        log.debug "Night Heating: starting at 22°C, fan auto"
+    } else {
+        BigDecimal hp = mideaThermostat.currentValue("heatingSetpoint") as BigDecimal
+        if (hp != 22.0) {
+            mideaThermostat.setHeatingSetpoint(22.0)
+        }
+        if (currentFan != "auto") {
+            mideaThermostat.setThermostatFanMode("auto")
+        }
+    }
+}
+
+// At specified hour, try to set fan to “silent” (if your driver supports it)
+def setFanSilent() {
+    if (!wouldDoNightHeating()) { return }
+    if (!mideaThermostat.hasCommand("setThermostatFanMode")) { return }
+
+    String currentMode = mideaThermostat.currentValue("thermostatMode")
+    if (currentMode != "heat") { return }
+
+    def supportedFans = mideaThermostat.currentValue("supportedThermostatFanModes")
+    if (supportedFans?.toString().contains("silent")) {
+        try {
+            mideaThermostat.setThermostatFanMode("silent")
+            log.debug "Night Heating: fan → silent"
+        } catch (ignored) {
+            log.debug "Failed to set fan to silent; device may not support it."
+        }
+    } else {
+        log.debug "Night Heating: silent fan mode not supported; keeping current fan"
+    }
+
+    // Start gradual temperature drop (1°C at a time)
+    dropHeatingByOneDegree()
+}
+
+// Reduce heating setpoint by 1°C, but:
+// - AC setpoint never goes below 16°C
+// - Stop once room has reached 15°C
+def dropHeatingByOneDegree() {
+    String currentMode = mideaThermostat.currentValue("thermostatMode")
+    if (currentMode != "heat") { return }
+
+    BigDecimal hp = mideaThermostat.currentValue("heatingSetpoint") as BigDecimal
+    BigDecimal currentTemp = tempSensor.currentValue("temperature") as BigDecimal
+
+    // Stop if:
+    // - AC is already at its minimum (16°C) dir the AC...)
+    // - Room temp has already dropped to 15°C or lower
+    if (hp <= minHeatingSetpoint) {
+        log.debug "Night Heating: AC setpoint already at minimum ${minHeatingSetpoint}°C"
+        return
+    }
+    if (currentTemp <= minDisplayTemp) {
+        log.debug "Night Heating: room temp ${currentTemp}°C ≤ ${minDisplayTemp}°C; not lowering AC further"
+        return
+    }
+
+    // Drop 1°C, but clamp at 16°C
+    BigDecimal newHp = Math.max(hp - 1.0, minHeatingSetpoint) as BigDecimal
+    if (newHp != hp) {
+        mideaThermostat.setHeatingSetpoint(newHp)
+        log.debug "Night Heating: dropping heating setpoint to ${newHp}°C (room=${currentTemp}°C)"
+    }
+}
