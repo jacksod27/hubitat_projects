@@ -118,6 +118,13 @@ def elapsedTime(now, then) {
     then ? (now - then) / 1000 : 0
 }
 
+runEvery30Minutes(pollHumidity)
+
+def pollHumidity() {
+    humiditySensor?.refresh()
+    runIn(2, acHandlerCycled)
+}
+
 // STATES (for cycles)
 
 def DRY_MODE = "dry"
@@ -134,7 +141,7 @@ def minShutOffSeconds = 180    // 3 minutes
 
 def humidityHandler(evt) {
     logDebug "Humidity changed: ${evt.value}%"
-    acHandlerCycled()
+    runIn(2, acHandlerCycled)   // debounce 2 seconds
 }
 
 def tempHandler(evt) {
