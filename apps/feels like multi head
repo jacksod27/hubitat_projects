@@ -1,0 +1,595 @@
+/*
+ * Midea Smart Control (Option B) - Clean Hubitat-safe version
+ *
+ * - Feels‑like + absolute humidity based control
+ * - 24–26°C setpoint from outdoor temp
+ * - Polls humidity every 30 min
+ * - 3‑minute minimum off to prevent short‑cycling
+ * - Dry mode 90 min max, 30 min fan cooldown, AH 9–11 g/m³ band
+ * - Heat/Cool max 2 hours, 30 min cooldown after >50% of max run
+ * - Silent fan mode at bedtime (Midea-specific, preserved)
+ */
+
+definition(
+    name: "Midea Smart Control",
+    namespace: "custom.midea",
+    author: "Jacksod27 + Perplexity + Cleaned",
+    description: "Smart control for Midea AC using feels-like, AH, short-cycle guards",
+    category: "Climate Control",
+    iconUrl: "",
+    iconX2Url: ""
+)
+
+preferences {
+    page(name: "mainPage")
+    // Night time switch for app
+    section("Dashboard Controls") {
+    input "nightModeSwitch", "capability.switch",
+        title: "Night Mode Dashboard Switch",
+        required: false
+}
+
+}
+
+def mainPage() {
+    dynamicPage(name: "mainPage", title: "Midea Smart Control", install: true, uninstall: true) {
+        section("Sensors") {
+            input "humiditySensor", "capability.relativeHumidityMeasurement",
+                title: "Humidity sensor", required: true
+            input "outdoorTempSensor", "capability.temperatureMeasurement",
+                title: "Outdoor temperature sensor (Celsius)", required: true
+            input "weatherForecast", "capability.temperatureMeasurement",
+                title: "Weather device (today's max temp attribute)", required: false
+            input "indoorTempSensor", "capability.temperatureMeasurement",
+                title: "Indoor temperature sensor", required: true
+        }
+        section("Midea AC units") {
+            input "mideaUnits", "capability.thermostat",
+                title: "Midea AC devices", required: true, multiple: true
+        }
+        section("Setpoints & Thresholds") {
+            input "minTemp", "number", 
+                title: "Min setpoint (C)", defaultValue: 24, required: true
+            input "maxTemp", "number", 
+                title: "Max setpoint (C)", defaultValue: 26, required: true
+            input "maintainAHLow", "number", 
+                title: "Maintain AH low (g/m³)", defaultValue: 9.0, required: false
+            input "maintainAHHigh", "number", 
+                title: "Maintain AH high (g/m³)", defaultValue: 11.0, required: false
+        }
+        section("BedTime") {
+            input "bedTime", "time", title: "Bedtime (for quiet mode)"
+        }
+        section("Options") {
+            input "enableLogging", "bool", title: "Enable debug logging",
+                defaultValue: true
+            input "useQuietNightMode", "bool", title: "Enable Silent Night Mode",
+                defaultValue: false
+            //Debugging switch
+            input "debugTrigger", "capability.switch", title: "DEBUG: Force acHandlerCycled()", 
+                required: false, submitOnChange: true
+        }
+    }
+}
+
+// LIFECYCLE
+
+def installed() {
+    logDebug "Installed"
+    initialize()
+}
+
+def updated() {
+    logDebug "Updated"
+    unsubscribe()
+    unschedule()
+    initialize()
+}
+
+def initialize() {
+    if (!state.deviceSessions) state.deviceSessions = [:]
+    state.lastDailyMax = state.lastDailyMax ?: null
+    state.currentSetpoint = state.currentSetpoint ?: null
+    state.isBedtime = false
+
+    subscribe(indoorTempSensor,  "temperature", tempHandler)
+    subscribe(humiditySensor,    "humidity",    humidityHandler)
+    subscribe(outdoorTempSensor, "temperature", tempHandler)
+
+    runEvery30Minutes(pollSensorsOnly)  // Safe sensor polls
+
+    // Daily max poll at noon
+    schedule("0 0 12 * * ? *", pollDailyMax)
+
+    if (useQuietNightMode && bedTime) {
+        def parts = (bedTime as String)?.split(':')
+        if (parts?.size() == 2) {
+            def cron = "0 ${parts[1].padLeft(2,'0')} ${parts[0].padLeft(2,'0')} * * ?"
+            schedule(cron, bedtimeTrigger)
+        }
+    }
+
+    logDebug "Initialized"
+
+    // Log initial conditions
+    runIn(5, logInitialConditions)
+    
+    // subscript to night time switch
+	if (nightModeSwitch) {
+    subscribe(nightModeSwitch, "switch", nightModeHandler)
+	}
+	
+    // debugging trigger
+    if (debugTrigger) {
+        subscribe(debugTrigger, "switch", debugTriggerHandler)
+    }
+    
+}
+
+def logInitialConditions() {
+    def temp = safeValue(indoorTempSensor, "temperature")
+    def rh   = safeValue(humiditySensor, "humidity")
+    def feelsLike = calcFeelsLike(temp, rh)
+    def ah = (temp && rh) ? calcAH(temp, rh)?.setScale(2, BigDecimal.ROUND_HALF_UP) : null
+
+    logInfo "=== STARTUP: T:${temp ?: '?'}°C, RH:${rh ?: '?'}%, Feels:${feelsLike ?: '?'}°C, AH:${ah?.setScale(2, BigDecimal.ROUND_HALF_UP) ?: '?'}g/m³ ==="
+    logDebug "Setpoints: min=${settings.minTemp ?: 24}, max=${settings.maxTemp ?: 26}"
+    logDebug "AC units: ${mideaUnits?.collect { it.displayName } ?: 'none'}"
+}
+
+// HELPERS
+
+def calcAH(T, RH) {
+    if (T == null || RH == null) return null
+    BigDecimal t = (T as BigDecimal)
+    BigDecimal rh = (RH as BigDecimal)
+    BigDecimal es = 6.112G * Math.exp((17.67G * t) / (t + 243.5G))
+    BigDecimal e  = es * (rh / 100G)
+    return (e * 100G * 2.16679G) / (t + 273.15G)
+}
+
+def calcFeelsLike(tempC, rh) {
+    if (tempC == null || rh == null) return null
+    BigDecimal t = (tempC as BigDecimal)
+    BigDecimal r = (rh as BigDecimal)
+    BigDecimal humBonus = (r - 50G)
+    if (humBonus < 0G) humBonus = 0G
+    humBonus = humBonus * 0.05G
+    return (t + humBonus).setScale(1, BigDecimal.ROUND_HALF_UP)
+}
+
+def safeValue(device, attr) {
+    try {
+        def v = device?.currentValue(attr)
+        return (v != null) ? new BigDecimal(v.toString()) : null
+    } catch (e) {
+        logDebug "safeValue error for ${device} ${attr}: ${e}"
+        return null
+    }
+}
+
+def elapsedMinutes(nowMs, thenMs) {
+    if (!thenMs) return 0G
+    BigDecimal diff = (nowMs - thenMs) as BigDecimal
+    return (diff / 60000G)
+}
+
+def elapsedSeconds(nowMs, thenMs) {
+    if (!thenMs) return 0G
+    BigDecimal diff = (nowMs - thenMs) as BigDecimal
+    return (diff / 1000G)
+}
+
+def getDeviceSession(dev) {
+    if (!state.deviceSessions) state.deviceSessions = [:]
+    def id = dev.id as String
+    if (!state.deviceSessions[id]) {
+        state.deviceSessions[id] = [
+            lastOn      : 0L,
+            lastOff     : 0L,
+            sessionStart: 0L,
+            modeAtStart : null
+        ]
+    }
+    return state.deviceSessions[id]
+}
+
+// CYCLE CONSTANTS
+
+def DRY_MODE           = "dry"
+def COOL_MODE          = "cool"
+def HEAT_MODE          = "heat"
+def FAN_MODE           = "fan_only"
+def OFF_MODE           = "off"
+def maxDryMinutes      = 90G
+def maxHeatCoolMinutes = 120G
+def cooldownMinutes    = 30G
+def minShutOffSeconds  = 180G
+
+// EVENTS
+
+def humidityHandler(evt) {
+    logDebug "Humidity changed: ${evt.value}%"
+    runIn(2, acHandlerCycled)
+}
+
+def tempHandler(evt) {
+    logDebug "Temp changed: ${evt.value}°C"
+    runIn(2, acHandlerCycled)
+}
+
+def bedtimeTrigger() {
+    logDebug "Bedtime triggered"
+    state.isBedtime = true
+}
+
+def pollSensorsOnly() {
+    logDebug "Polling sensors only (no AC)"
+    safeRefresh(indoorTempSensor)
+    safeRefresh(humiditySensor)
+    safeRefresh(outdoorTempSensor)
+    runIn(2, acHandlerCycled)
+}
+
+def pollDailyMax() {
+    logDebug "Daily max temp poll"
+    safeRefresh(weatherForecast)
+    // Next sensor event will pick it up
+}
+
+def safeRefresh(dev) {
+    if (!dev) return
+    try {
+        if (dev.hasCapability("Refresh")) {
+            dev.refresh()
+        }
+    } catch (e) {
+        logDebug "safeRefresh error on ${dev}: ${e}"
+    }
+}
+// This updates the app’s internal setting whenever the dashboard night switch changes:
+def nightModeHandler(evt) {
+    def val = evt.value
+    state.isBedtime = (val == "on")
+    logInfo "Night Mode toggled from dashboard: ${state.isBedtime}"
+
+    // Optional: immediately re-evaluate AC logic
+    runIn(1, acHandlerCycled)
+}
+
+
+// MAIN CONTROL
+
+def acHandlerCycled() {
+    def temp = safeValue(indoorTempSensor, "temperature")
+    def rh   = safeValue(humiditySensor, "humidity")
+    if (temp == null || rh == null) {
+        logDebug "Missing sensors; skip"
+        return
+    }
+
+    def feelsLike = calcFeelsLike(temp, rh)
+    def ah        = calcAH(temp, rh)
+    boolean highHumidity = (rh >= 59G || (ah != null && ah >= 11.5G))
+
+    def dailyMaxTemp = state.lastDailyMax ?: safeValue(weatherForecast, "todayMaxTemp") ?: 30G
+    state.lastDailyMax = dailyMaxTemp
+    boolean heatEnabled = (dailyMaxTemp < 22.0G)
+
+    // Comfort early exit
+    if (feelsLike != null &&
+        // using user-set minTemp and maxTemp as the comfortable feels-like band
+        feelsLike >= (settings.minTemp as BigDecimal) &&
+        feelsLike <= (settings.maxTemp as BigDecimal) &&
+        !heatEnabled &&
+        !highHumidity) {
+
+        logInfo "Comfort ${feelsLike}°C (T:${temp}°C RH:${rh}%) | Skip AC"
+        return
+    }
+    
+    boolean inComfortBand = (feelsLike >= (minTemp as BigDecimal) && 
+                        feelsLike <= (maxTemp as BigDecimal) && 
+                        !heatEnabled && !highHumidity)
+
+    logDebug "[MideaSmartControl] Feels-like: ${feelsLike}°C, AH:${ah?.setScale(2, BigDecimal.ROUND_HALF_UP)}g/m³"
+    logDebug "Daily max ${dailyMaxTemp}°C; heatEnabled=${heatEnabled}"
+
+    def nowMs = new Date().time
+
+    BigDecimal minSp = ((settings.minTemp ?: 24G) as BigDecimal)
+    BigDecimal maxSp = ((settings.maxTemp ?: 26G) as BigDecimal)
+    BigDecimal outT  = safeValue(outdoorTempSensor, "temperature")?.setScale(0, BigDecimal.ROUND_HALF_UP) ?: 25G
+    BigDecimal setpoint = [minSp, outT, maxSp].sort()[1] as BigDecimal
+    state.currentSetpoint = setpoint
+    logDebug "Setpoint: ${setpoint}°C (outdoor: ${outT}°C)"
+
+    def decision = makeThreePhaseDecision(temp, rh, ah, feelsLike, setpoint, nowMs, heatEnabled, inComfortBand)
+    
+    logDebug "=== DECISION DEBUG ==="
+    if (decision instanceof Map) { 
+        logDebug " MAP OK" 
+        logDebug " reason: ${decision.reason}" 
+        logDebug " turnOn=${decision.turnOn} turnOff=${decision.turnOff}" 
+        logDebug " mode=${decision.setMode} setpoint=${decision.setSetpoint}" 
+    } 
+    else { 
+        log.warn " NOT MAP - value: ${decision}" // warn() not error() 
+    }
+    if (decision instanceof Map && !skipApply) {
+        logInfo "[${midea.displayName}] → ${decision.setMode ?: 'HOLD'} ${decision.setSetpoint ?: '?'}°C | ${decision.reason}"
+    }
+    logDebug "======================"
+
+    mideaUnits?.each { midea ->
+        def session = getDeviceSession(midea)
+        BigDecimal elapsedMin = elapsedMinutes(nowMs, session.sessionStart ?: 0L)
+
+        def currentMode = midea.currentValue("thermostatMode") ?: "off"
+        boolean isOn = (currentMode != "off")
+        String currentState = isOn ? "on" : "off"
+
+        boolean skipApply = false
+
+        // 1. 3-minute minimum off guard
+        if (session.lastOff && session.lastOff > 0L) {
+            BigDecimal secondsSinceOff = elapsedSeconds(nowMs, session.lastOff)
+            if (secondsSinceOff < minShutOffSeconds) {
+                logDebug "[${midea.displayName}] Block restart: ${secondsSinceOff.setScale(0, BigDecimal.ROUND_HALF_UP)}s since last off, need ${minShutOffSeconds}s"
+                skipApply = true
+            }
+        }
+
+        // 2. Dry mode limits
+        if (!skipApply && currentMode == DRY_MODE) {
+            if (elapsedMin >= maxDryMinutes) {
+                logInfo "[${midea.displayName}] Dry max ${maxDryMinutes}min; switching to fan cooldown"
+                midea.setThermostatMode(FAN_MODE)
+                session.sessionStart = nowMs
+                session.modeAtStart  = DRY_MODE
+                session.lastOff      = 0L
+                skipApply = true
+            } else if (ah != null && ah < 9.0G) {
+                logInfo "[${midea.displayName}] AH ${ah.round(1)} < 9; switching to fan cooldown"
+                midea.setThermostatMode(FAN_MODE)
+                session.sessionStart = nowMs
+                session.modeAtStart  = DRY_MODE
+                session.lastOff      = 0L
+                skipApply = true
+            } else if (ah != null && ah > 12.0G && decision.setMode != DRY_MODE) {
+                decision.setMode     = DRY_MODE
+                decision.setSetpoint = [24.0G, temp, 26.0G].findAll { it != null }.collect { it as BigDecimal }.sort()[1]
+            }
+        }
+
+        // 3. Fan cooldown after Dry
+        if (!skipApply &&
+            session.modeAtStart == DRY_MODE &&
+            currentMode == FAN_MODE &&
+            elapsedMin < cooldownMinutes) {
+            logDebug "[${midea.displayName}] Fan cooldown ${elapsedMin.setScale(1, BigDecimal.ROUND_HALF_UP)}min; skip"
+            skipApply = true
+        } else if (!skipApply &&
+                   session.modeAtStart == DRY_MODE &&
+                   currentMode == FAN_MODE &&
+                   elapsedMin >= cooldownMinutes) {
+            logInfo "[${midea.displayName}] Cooldown complete; resume control"
+            session.sessionStart = nowMs
+            session.modeAtStart  = null
+        }
+
+        // 4. Heat/Cool max runtime
+        if (!skipApply && currentMode in [COOL_MODE, HEAT_MODE] && elapsedMin >= maxHeatCoolMinutes) {
+            logInfo "[${midea.displayName}] ${currentMode} max time; OFF"
+            midea.setThermostatMode(OFF_MODE)
+            session.sessionStart = 0L
+            session.modeAtStart  = null
+            session.lastOff      = nowMs
+            skipApply = true
+        }
+
+        // 5. Post-cycle cooldown (per device)
+        if (!skipApply && !isOn && session.lastOff && session.lastOff > 0L) {
+            BigDecimal secondsSinceOff = elapsedSeconds(nowMs, session.lastOff)
+            BigDecimal needed = cooldownMinutes * 60G
+            if (secondsSinceOff < needed) {
+                BigDecimal remainingMin = ((needed - secondsSinceOff) / 60G).setScale(1, BigDecimal.ROUND_HALF_UP)
+                logDebug "[${midea.displayName}] Post-cycle cooldown: ${remainingMin}min remaining"
+                skipApply = true
+            }
+        }
+
+        if (!skipApply) {
+            if (decision.turnOff && isOn) {
+                midea.setThermostatMode(OFF_MODE)
+                session.lastOff      = nowMs
+                session.sessionStart = 0L
+                session.modeAtStart  = null
+            } else if (decision.turnOn && !isOn && decision.setMode) {
+                midea.setThermostatMode(decision.setMode)
+                session.lastOn       = nowMs
+                session.sessionStart = nowMs
+                session.modeAtStart  = decision.setMode
+            }
+
+            def currMode = midea.currentValue("thermostatMode") ?: "off"
+            if (decision.setMode && decision.setMode != currMode) {
+                midea.setThermostatMode(decision.setMode)
+            }
+
+            def currSetpoint = safeValue(midea, "coolingSetpoint")
+            if (decision.setSetpoint != null && decision.setSetpoint != currSetpoint) {
+                midea.setCoolingSetpoint(decision.setSetpoint)
+            }
+
+            def currFan = midea.currentValue("thermostatFanMode") ?: "auto"
+            if (decision.setFan && decision.setFan != currFan &&
+                decision.setMode in [COOL_MODE, HEAT_MODE, DRY_MODE]) {
+                // Midea-specific: allow "silent" as requested
+                midea.setThermostatFanMode(decision.setFan)
+            }
+        }
+
+        logInfo "[${midea.displayName}] ${decision.setMode ?: 'off'} ${decision.setSetpoint ?: '?'}°C fan=${decision.setFan} | ${decision.reason}"
+    }
+}
+
+// MODE / SETPOINT LOGIC
+
+def makeThreePhaseDecision(temp, rh, ah, feelsLike, setpoint, nowMs, heatEnabled, inComfortBand) {
+    def decision = [turnOn: false, turnOff: false, setMode: null, setSetpoint: null, setFan: null, reason: "", phase: state.phase]
+
+    def nowDate = new Date(nowMs)
+    def hour = nowDate.format("H", location.timeZone) as Integer
+    def isEveningOrNight = (hour >= 18 || hour <= 6)
+    def quiet = (useQuietNightMode && isEveningOrNight) || state.isBedtime
+    decision.setFan = quiet ? "silent" : "auto"
+
+    def outdoorTemp = safeValue(outdoorTempSensor, "temperature") ?: 25G
+
+    // Phase 2 — Enter comfort: One last nudge heuristics
+    // Nudge amount calculation 
+    BigDecimal bandWidth = ((maxTemp as BigDecimal) - (minTemp as BigDecimal)).abs()
+    BigDecimal nudge
+    if (bandWidth <= 1.5G)      nudge = 0.3G
+    else if (bandWidth <= 3.0G) nudge = 0.5G
+    else                        nudge = 1.0G
+
+    // Cooling nudge (approach from above)
+    BigDecimal coolTarget = (((maxTemp as BigDecimal) - nudge).setScale(1, BigDecimal.ROUND_HALF_UP))
+    // Heating nudge (approach from below)
+    BigDecimal heatTarget = (((minTemp as BigDecimal) + nudge).setScale(1, BigDecimal.ROUND_HALF_UP))
+    // Dry mode midpoint 
+    BigDecimal dryTarget = (((minTemp as BigDecimal) + (maxTemp as BigDecimal)) / 2G).setScale(1, BigDecimal.ROUND_HALF_UP)
+
+    // PRIORITY 1: Humidity override
+    if (rh > 59G) {
+        def target = [16G, dryTarget, 30G].sort()[1]
+        decision.setMode = DRY_MODE
+        decision.setSetpoint = target
+        decision.setFan = "auto"
+        decision.turnOn = true
+        decision.reason = "HUMIDITY OVERRIDE: RH " + rh + "% -> Dry @ " + target + "°C" //uses local target variable
+        return decision
+    }
+
+    // Phase 1 vs Phase 2 detection using nudge targets
+    boolean coolingNeeded = (feelsLike > coolTarget)
+    boolean heatingNeeded = (heatEnabled && feelsLike < heatTarget)
+    boolean phase1Active = coolingNeeded || heatingNeeded
+
+    if (phase1Active) {
+        state.phase = "approach"
+        decision.phase = "approach"
+        
+        if (heatingNeeded) {
+            // Phase 1 heating nudge
+            def target = outdoorTemp + 1G
+            if (target > heatTarget) target = heatTarget
+            target = [16G, target, 30G].sort()[1]
+            decision.setMode = HEAT_MODE
+            decision.setSetpoint = target.setScale(1, BigDecimal.ROUND_HALF_UP)
+            decision.turnOn = true
+            decision.reason = "Phase 1: Cold " + feelsLike + "°C < heatTarget " + heatTarget + "°C -> Heat nudge " + decision.setSetpoint
+        } else if (coolingNeeded) {
+            // Phase 1 cooling nudge
+            def target = outdoorTemp - 1G
+            if (target < coolTarget) target = coolTarget
+            target = [16G, target, 30G].sort()[1]
+            decision.setMode = COOL_MODE
+            decision.setSetpoint = target.setScale(1, BigDecimal.ROUND_HALF_UP)
+            decision.turnOn = true
+            decision.reason = "Phase 1: Hot " + feelsLike + "°C > coolTarget " + coolTarget + "°C -> Cool nudge " + decision.setSetpoint
+        }
+    } else {
+        // ============================ 
+        // PHASE 2 — ENTER COMFORT - stop aggressive, do maintenance
+        // ============================
+        state.phase = "maintain"
+        decision.phase = "maintain"
+
+        if (ah && ah > maintainAHHigh) {
+            decision.setMode = DRY_MODE
+            decision.setSetpoint = dryTarget
+            decision.turnOn = true
+            decision.reason = "Phase 2: Enter comfort, High AH -> Dry @ midpoint " + dryTarget + "°C"
+            return decision
+        } else if (ah && ah < maintainAHLow) {
+            decision.setMode = FAN_MODE
+            decision.turnOn = true
+            decision.reason = "Phase 2: Enter comfort, Low AH -> Fan"
+            return decision
+        } else {
+            // ============================
+    		// PHASE 3 — MAINTAIN COMFORT
+    		// ============================
+            state.phase = "maintain"
+            decision.phase = "maintain"
+
+            // Micro-nudge amount (gentle correction)
+            BigDecimal micro = 0.3G
+
+            // 3A — Slight drift above comfort band → tiny cooling nudge
+            if (feelsLike > maxTemp && feelsLike <= maxTemp + 0.8G) {
+                BigDecimal target = (maxTemp - micro).setScale(1, BigDecimal.ROUND_HALF_UP)
+                decision.setMode     = COOL_MODE
+                decision.setSetpoint = [16G, target, 30G].sort()[1]
+                decision.turnOn      = true
+                decision.reason      = "Phase 3: Slightly warm -> micro cooling nudge to " + decision.setSetpoint + "°C"
+                return decision
+            }
+
+            // 3B — Slight drift below comfort band → tiny heating nudge
+            if (heatEnabled && feelsLike < minTemp && feelsLike >= minTemp - 0.8G) {
+                BigDecimal target = (minTemp + micro).setScale(1, BigDecimal.ROUND_HALF_UP)
+                decision.setMode     = HEAT_MODE
+                decision.setSetpoint = [16G, target, 30G].sort()[1]
+                decision.turnOn      = true
+                decision.reason      = "Phase 3: Slightly cool -> micro heating nudge to " + decision.setSetpoint + "°C"
+                return decision
+            }
+
+            // 3C — Humidity-driven maintenance
+            if (ah && ah > maintainAHHigh) {
+                decision.setMode     = DRY_MODE
+                decision.setSetpoint = dryTarget
+                decision.turnOn      = true
+                decision.reason      = "Phase 3: High AH -> Dry @ midpoint " + dryTarget + "°C"
+                return decision
+            }
+
+            if (ah && ah < maintainAHLow) {
+                decision.setMode = FAN_MODE
+                decision.turnOn  = true
+                decision.reason  = "Phase 3: Low AH -> Fan mode"
+                return decision
+            }
+
+            // 3D — Neutral humidity → OFF
+            decision.setMode = OFF_MODE
+            decision.turnOff = true
+            decision.reason  = "Phase 3: Comfort stable -> AC off"
+            return decision
+        }
+    }
+            //decision.setMode = OFF_MODE
+            //decision.turnOff = true
+            //decision.reason = "Phase 2: Comfort entered (${coolTarget}-${heatTarget}°C band) -> OFF"
+
+}
+
+//DEBUGGING SWITCH 
+
+def debugTriggerHandler(evt) {
+    logInfo "DEBUG EVENT RECEIVED: ${evt.name}=${evt.value} from ${evt.device.displayName}"
+    
+    if (evt.value == "on") {
+        logInfo "*** DEBUG TRIGGER FIRED → acHandlerCycled() ***"
+        acHandlerCycled()
+    }
+}
+
+// LOGGING HELPERS
+
+private logDebug(msg) { if (enableLogging) log.debug "[MideaSmartControl] ${msg}" }
+private logInfo(msg)  { log.info  "[MideaSmartControl] ${msg}" }
