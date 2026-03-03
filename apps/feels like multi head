@@ -102,10 +102,13 @@ def initialize() {
     state.isBedtime = false
 
     state.zones = buildZonesFromSettings()  // New helper method
+	// Subscribe PER ZONE
     state.zones.each { zoneId, zone ->
         subscribe(zone.tempSensor, "temperature", tempHandler)
         subscribe(zone.humiditySensor, "humidity", humidityHandler)
     }
+	// Global sensor subscribe 
+	subscribe(outdoorTempSensor, "temperature", tempHandler)
 
     runEvery30Minutes(pollSensorsOnly)  // Safe sensor polls
 
