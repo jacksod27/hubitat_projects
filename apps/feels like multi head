@@ -85,6 +85,13 @@ def updated() {
     logDebug "Updated"
     unsubscribe()
     unschedule()
+    
+    // Reset zone state/UI
+    state.remove("zones")
+    state.remove("zoneCount")
+    state.zonesCreated = false
+    app.updateSetting("addZone", [value: false])
+    
     initialize()
 }
 
