@@ -34,12 +34,16 @@ metadata
     definition(name: "Midea AC local controller", namespace: "tomw", author: "tomw", importUrl: "")
     {
         attribute "outdoorTemperature", "number"
+        attribute "swingMode", "string"  // e.g., "off", "vertical", "horizontal", "both"
+        attribute "verticalSwing", "enum", ["on", "off"]  // Or "position" as number 0-100 if supported
+        attribute "horizontalSwing", "enum", ["on", "off"]  // Same for horizontal
         
         capability "Configuration"
         capability "FanControl"
         capability "Initialize"
         capability "Refresh"
         capability "Thermostat"
+        capability "Valve"  // Reuse for swing (open=swing on, closed=off) or add custom
         
         command "dry"
         command "fan_only"
@@ -47,6 +51,9 @@ metadata
         command "setSpeed", [[name: "Fan speed*", type: "ENUM", constraints: supportedFanSpeedsList()]]
         command "setThermostatFanMode", [[name: "Fan mode*", type: "ENUM", constraints: supportedThermoFanModesList()]]        
         command "setThermostatMode", [[name: "Thermostat mode*", type: "ENUM", constraints: supportedThermoModesList()]]
+        command "setSwingMode", [[name: "Swing mode*", type: "ENUM", constraints: ["off", "vertical", "horizontal", "both"]]]
+        command "setVerticalSwing", [[name: "Vertical*", type: "ENUM", constraints: ["on", "off"]]]
+        command "setHorizontalSwing", [[name: "Horizontal*", type: "ENUM", constraints: ["on", "off"]]]
         
         command "controlTurboMode", [[name: "Turbo mode*", type: "ENUM", constraints: ["on", "off"]]]
         attribute "turboMode", "enum", ["on", "off"]
@@ -87,8 +94,11 @@ def configure()
     sendEvent(name: "supportedFanSpeeds", value: fanSpeeds)
 
     def thermoModes = jsonOut.toJson(supportedThermoModesList())
-    sendEvent(name: "supportedThermostatModes", value: thermoModes)    
-    
+    sendEvent(name: "supportedThermostatModes", value: thermoModes)  
+
+    def supportedSwingModesList() { return ["off", "vertical", "horizontal", "both"] 
+}
+
     initialize()
 }
 
@@ -105,6 +115,11 @@ def supportedFanSpeedsList()
 def supportedThermoModesList()
 {
     return ["auto", "cool", "dry", "fan_only", "heat", "off"]    
+}
+
+def supportedSwingModesList() 
+{     
+    return ["off", "vertical", "horizontal", "both"] 
 }
 
 def initialize()
@@ -577,7 +592,11 @@ def _updateAttributes(resp)
     events +=    [name: "thermostatSetpoint",          value: correctTemp(resp.target_temperature, "C"), unit: getUnit()]
     events +=    [name: "outdoorTemperature",          value: correctTemp(resp.outdoor_temperature, "C"), unit: getUnit()]
     events +=    [name: "turboMode",                   value: resp.turbo_mode ? "on" : "off"]
-    
+
+    events +=    [name: "swingMode",                   value: translateSwingMode(resp.swing_mode)]
+    events +=    [name: "verticalSwing",               value: resp.vertical_swing ? "on" : "off"]
+    events +=    [name: "horizontalSwing",             value: resp.horizontal_swing ? "on" : "off"]
+
     events.each
     {
         sendEvent(it)
@@ -650,6 +669,33 @@ def translateFanMode(value, inputType)
         
         default:
             return
+    }
+}
+
+// ADDED
+
+def translateSwingMode(value, inputType = "integer") 
+{
+    switch(inputType) 
+    {
+        case "integer":
+            switch(value) 
+            {
+                case 0: return "off"
+                case 1: return "vertical"  // Or check your refresh() logs
+                case 2: return "horizontal"
+                case 3: return "both"
+                default: return "unknown"
+            }
+        case "string":
+            switch(value) 
+            {
+                case "off": return 0
+                case "vertical": return 1
+                case "horizontal": return 2
+                case "both": return 3
+                default: return null
+            }
     }
 }
 
@@ -914,6 +960,13 @@ def appliance_response(data)
     
     
     resp += [swing_mode:              data[0x07] & 0x0f]
+
+    // Add bit-based parsing (common for Midea 0xAC)
+    def swing_byte = data[0x07]
+    resp += [vertical_swing: (swing_byte & 0x10) > 0]  // Bit 4: vertical on/off
+    resp += [horizontal_swing: (swing_byte & 0x20) > 0]  // Bit 5: horizontal on/off
+    resp += [swing_louver_pos: swing_byte & 0x0f]  // 0-15 discrete positions (if your model uses)
+
     resp += [cozy_sleep:              data[0x08] & 0x03]
     resp += [save:                    (data[0x08] & 0x08) > 0]
     resp += [low_frequency_fan:       (data[0x08] & 0x10) > 0]
