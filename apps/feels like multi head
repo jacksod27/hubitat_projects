@@ -32,6 +32,120 @@ preferences {
 }
 
 def mainPage() {
+    dynamicPage(name: "mainPage", title: "Zones", install: true, uninstall: true) {
+
+	if (settings.errorMessage) { section("⚠️ Validation Error") { paragraph "<b>${settings.errorMessage}</b>" } }
+
+		section("Zones") {
+            input name: "addZone", type: "button", title: "Add Zone", submitOnChange: true
+        }
+
+        if (addZone) {
+            state.zoneCount = (state.zoneCount ?: 0) + 1
+            app.updateSetting("addZone", [value:"", type:"button"])
+        }
+
+        if (!state.zoneCount) state.zoneCount = 0
+
+        (1..state.zoneCount).each { z ->
+            section("Zone ${z}") {
+                input "acUnit_${z}", "capability.thermostat", title: "AC Unit", required: true
+                input "tempSensor_${z}", "capability.temperatureMeasurement", title: "Temperature Sensor", required: true
+                input "humiditySensor_${z}", "capability.relativeHumidityMeasurement", title: "Humidity Sensor", required: true
+
+                input name: "removeZone_${z}", type: "button", title: "Remove Zone ${z}", submitOnChange: true
+            }
+
+            if (settings["removeZone_${z}"]) {
+                removeZone(z)
+                app.updateSetting("removeZone_${z}", [value:"", type:"button"])
+            }
+        }
+    }
+}
+
+
+// Global settings
+	section("Outdoor Weather Sensor") {
+	    input "outdoorTempSensor", "capability.temperatureMeasurement",
+	        title: "Outdoor temperature sensor (Celsius)", required: true
+	}
+	
+	section("Comfort Band (Feels-like)") {
+	    input "minTemp", "number", 
+	        title: "Lower comfortable feels-like temperature (°C)", 
+	        defaultValue: 24, required: true
+	
+	    input "maxTemp", "number", 
+	        title: "Upper comfortable feels-like temperature (°C)", 
+	        defaultValue: 26, required: true
+	}
+	
+	section("Absolute Humidity Thresholds") {
+	    input "maintainAHLow", "number", 
+	        title: "Maintain AH low (g/m³)", defaultValue: 9.0, required: false
+	
+	    input "maintainAHHigh", "number", 
+	        title: "Maintain AH high (g/m³)", defaultValue: 11.0, required: false
+	}
+	
+	section("Quiet Hours") {
+	    input "bedTime", "time", title: "Bedtime (for quiet mode)"
+	}
+
+// Zone Management
+	section("Zones") {
+	    input name: "addZone", type: "button", title: "Add Zone", submitOnChange: true
+	}
+	
+	if (addZone) {
+	    state.zoneCount = (state.zoneCount ?: 0) + 1
+	    app.updateSetting("addZone", [value:"", type:"button"])
+	}
+	
+	if (!state.zoneCount) state.zoneCount = 0
+	
+	(1..state.zoneCount).each { z ->
+	    section("Zone ${z}") {
+	        input "acUnit_${z}", "capability.thermostat", 
+	            title: "AC Unit", required: true
+	
+	        input "tempSensor_${z}", "capability.temperatureMeasurement", 
+	            title: "Temperature Sensor", required: true
+	
+	        input "humiditySensor_${z}", "capability.relativeHumidityMeasurement", 
+	            title: "Humidity Sensor", required: true
+	
+	        input name: "removeZone_${z}", type: "button", 
+	            title: "Remove Zone ${z}", submitOnChange: true
+	    }
+
+	    if (settings["removeZone_${z}"]) {
+	        removeZone(z)
+	        app.updateSetting("removeZone_${z}", [value:"", type:"button"])
+	    }
+	}
+// zone removal
+def removeZone(Integer z) {
+    Integer count = state.zoneCount ?: 0
+    if (z > count) return
+
+    // Shift all zones above the removed one down by 1
+    for (int i = z; i < count; i++) {
+        settings["acUnit_${i}"] = settings["acUnit_${i+1}"]
+        settings["tempSensor_${i}"] = settings["tempSensor_${i+1}"]
+        settings["humiditySensor_${i}"] = settings["humiditySensor_${i+1}"]
+    }
+
+    // Remove last zone’s settings
+    app.removeSetting("acUnit_${count}")
+    app.removeSetting("tempSensor_${count}")
+    app.removeSetting("humiditySensor_${count}")
+
+    state.zoneCount = count - 1
+}
+
+
     dynamicPage(name: "mainPage", title: "Midea Smart Control", install: true, uninstall: true) {
         section("Zones (Midea Head + Room Sensors)") {
 		    if (!state.zonesCreated) {
@@ -82,15 +196,34 @@ def installed() {
 }
 
 def updated() {
-    logDebug "Updated"
-    unsubscribe()
-    unschedule()
-    
-    // Reset zone state/UI
-    state.remove("zones")
-    state.remove("zoneCount")
-    state.zonesCreated = false
-    app.updateSetting("addZone", [value: false])
+    log.info "Saving ${state.zoneCount} zones"
+
+    state.zones = (1..state.zoneCount).collect { z ->
+        [
+            id: z,
+            acUnit: settings["acUnit_${z}"],
+            tempSensor: settings["tempSensor_${z}"],
+            humiditySensor: settings["humiditySensor_${z}"]
+        ]
+    }
+
+    // Validate unique AC units
+    def acList = state.zones*.acUnit
+    def duplicates = acList.findAll { ac -> acList.count(ac) > 1 }.unique()
+
+    if (duplicates) {
+        log.warn "Duplicate AC units detected: ${duplicates}"
+        app.updateSetting("errorMessage", [
+            value: "Duplicate AC units detected. Each zone must have a unique AC unit.",
+            type: "text"
+        ])
+    } else {
+        app.removeSetting("errorMessage")
+    }
+
+    log.debug "Zones saved: ${state.zones}"
+}
+
     
     initialize()
 }
