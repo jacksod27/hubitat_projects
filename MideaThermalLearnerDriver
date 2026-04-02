@@ -1,0 +1,221 @@
+/*
+ * MideaThermalLearner  Virtual driver for per-zone thermal inertia learning
+ * Namespace: custom.midea
+ * Version:   1.0.0
+ *
+ * One instance per AC zone, created automatically as a child device by
+ * MultiHeadMidea3. Stores drift curve data in device state and exposes
+ * derived k values as attributes for the SmartApp to read.
+ *
+ * Lifecycle:
+ *   1. SmartApp calls recordShutdown(feelsLike, outT, season) when it
+ *      shuts off an AC unit for comfort reasons (not error/conflict/timeout).
+ *   2. While the unit is off, the SmartApp calls recordDriftPoint(feelsLike,
+ *      outT) every cycle (~1 min).
+ *   3. When the SmartApp turns the unit back on (band edge reached or
+ *      override), it calls commitCurve(season). The driver finalises the
+ *      current drift curve, derives k, and updates attributes.
+ *   4. If the unit is turned on for a non-comfort reason (error recovery,
+ *      manual override) call discardCurve() to abandon the in-progress curve
+ *      without polluting the dataset.
+ *
+ * Attributes (readable by SmartApp):
+ *   kCool           Median thermal constant for cooling season (C/min per C delta)
+ *   kHeat           Median thermal constant for heating season
+ *   kCoolSamples    Number of valid cooling curves contributing to kCool
+ *   kHeatSamples    Number of valid heating curves contributing to kHeat
+ *   kCoolReady      true when kCoolSamples >= MIN_SAMPLES_FOR_K
+ *   kHeatReady      true when kHeatSamples >= MIN_SAMPLES_FOR_K
+ *   lastUpdated     ISO timestamp of last curve commit
+ *   curveActive     true while a drift curve is in progress
+ *
+ * Commands:
+ *   recordShutdown(feelsLike, outT, season)   Start a new drift curve
+ *   recordDriftPoint(feelsLike, outT)         Append a point to active curve
+ *   commitCurve(season)                       Finalise curve and update k
+ *   discardCurve()                            Abandon in-progress curve
+ *   resetLearning(season)                     Clear all curves for a season
+ *                                              ("cool", "heat", or "all")
+ */
+
+#include myMidea.MideaPsychrometrics
+#include myMidea.MideaThermalLearning
+
+metadata {
+    definition(
+        name:      "Midea Thermal Learner",
+        namespace: "custom.myMidea",
+        author:    "Midea AC Zone Control"
+    ) {
+        capability "Sensor"
+
+        attribute "kCool",        "number"
+        attribute "kHeat",        "number"
+        attribute "kCoolSamples", "number"
+        attribute "kHeatSamples", "number"
+        attribute "kCoolReady",   "string"   // "true" / "false"
+        attribute "kHeatReady",   "string"
+        attribute "lastUpdated",  "string"
+        attribute "curveActive",  "string"   // "true" / "false"
+
+        command "recordShutdown",  [[name: "feelsLike", type: "NUMBER", description: "Feels-like temp C at shutdown"],
+                                    [name: "outT",      type: "NUMBER", description: "Outdoor temp C at shutdown"],
+                                    [name: "season",    type: "ENUM",   constraints: ["cool", "heat"]]]
+
+        command "recordDriftPoint",[[name: "feelsLike", type: "NUMBER", description: "Current feels-like temp C"],
+                                    [name: "outT",      type: "NUMBER", description: "Current outdoor temp C"]]
+
+        command "commitCurve",     [[name: "season",    type: "ENUM",   constraints: ["cool", "heat"]]]
+
+        command "discardCurve"
+
+        command "resetLearning",   [[name: "season",    type: "ENUM",   constraints: ["cool", "heat", "all"]]]
+    }
+
+    preferences {
+        input name: "logEnable", type: "bool", title: "Enable debug logging", defaultValue: false
+    }
+}
+
+//  Lifecycle 
+
+def installed() {
+    log.info "${device.displayName}: installed"
+    _initAttributes()
+}
+
+def updated() {
+    log.info "${device.displayName}: preferences saved"
+}
+
+def _initAttributes() {
+    if (device.currentValue("kCoolReady") == null) sendEvent(name: "kCoolReady",   value: "false")
+    if (device.currentValue("kHeatReady") == null) sendEvent(name: "kHeatReady",   value: "false")
+    if (device.currentValue("kCoolSamples") == null) sendEvent(name: "kCoolSamples", value: 0)
+    if (device.currentValue("kHeatSamples") == null) sendEvent(name: "kHeatSamples", value: 0)
+    if (device.currentValue("curveActive")  == null) sendEvent(name: "curveActive",  value: "false")
+}
+
+//  Commands 
+
+/**
+ * Start a new drift curve at the moment of comfort shutdown.
+ * Discards any previously active curve (should not happen in normal operation).
+ */
+def recordShutdown(Number feelsLike, Number outT, String season) {
+    if (feelsLike == null || outT == null) {
+        log.warn "${device.displayName}: recordShutdown called with null inputs  ignored"
+        return
+    }
+    if (device.currentValue("curveActive") == "true") {
+        logDebug "recordShutdown: discarding orphaned active curve before starting new one"
+        state.remove("activeCurve")
+        state.remove("activeSeason")
+    }
+    long nowMs = now()
+    state.activeCurve  = [[feelsLike: (feelsLike as BigDecimal), outT: (outT as BigDecimal), timestampMs: nowMs]]
+    state.activeSeason = season
+    sendEvent(name: "curveActive", value: "true")
+    logDebug "recordShutdown: started ${season} curve  feelsLike=${feelsLike}C outT=${outT}C"
+}
+
+/**
+ * Append a drift measurement to the active curve.
+ * Silently ignored if no curve is active.
+ */
+def recordDriftPoint(Number feelsLike, Number outT) {
+    if (device.currentValue("curveActive") != "true") return
+    if (feelsLike == null || outT == null) return
+    List curve = state.activeCurve ?: []
+    curve << [feelsLike: (feelsLike as BigDecimal), outT: (outT as BigDecimal), timestampMs: now()]
+    state.activeCurve = curve
+    logDebug "recordDriftPoint: +1 point (${curve.size()} total) feelsLike=${feelsLike}C"
+}
+
+/**
+ * Finalise the active drift curve, derive k, and update attributes.
+ * season should match the season passed to recordShutdown.
+ */
+def commitCurve(String season) {
+    if (device.currentValue("curveActive") != "true") {
+        logDebug "commitCurve: no active curve  ignored"
+        return
+    }
+    List curve = state.activeCurve ?: []
+    String activeSeason = state.activeSeason ?: season
+
+    // Attempt k derivation from this curve
+    BigDecimal kVal = kFromDriftCurve(curve)
+    if (kVal == null) {
+        logDebug "commitCurve: curve yielded no valid k (${curve.size()} points, insufficient drift or delta)  discarded"
+    } else {
+        // Store completed curve in rolling window
+        String storeKey = (activeSeason == "heat") ? "curvesHeat" : "curvesCool"
+        List stored = addCurve(state[storeKey], curve)
+        state[storeKey] = stored
+
+        // Re-derive k from full stored set
+        BigDecimal kMedian = deriveK(stored)
+        boolean ready      = hasEnoughData(stored)
+        int sampleCount    = stored.collect { kFromDriftCurve(it) }.findAll { it != null }.size()
+
+        if (activeSeason == "heat") {
+            if (kMedian != null) sendEvent(name: "kHeat", value: kMedian)
+            sendEvent(name: "kHeatSamples", value: sampleCount)
+            sendEvent(name: "kHeatReady",   value: ready.toString())
+            logDebug "commitCurve [heat]: k=${kMedian} samples=${sampleCount} ready=${ready}"
+        } else {
+            if (kMedian != null) sendEvent(name: "kCool", value: kMedian)
+            sendEvent(name: "kCoolSamples", value: sampleCount)
+            sendEvent(name: "kCoolReady",   value: ready.toString())
+            logDebug "commitCurve [cool]: k=${kMedian} samples=${sampleCount} ready=${ready}"
+        }
+        sendEvent(name: "lastUpdated", value: new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"))
+    }
+
+    // Clear active curve regardless of outcome
+    state.remove("activeCurve")
+    state.remove("activeSeason")
+    sendEvent(name: "curveActive", value: "false")
+}
+
+/**
+ * Abandon the active drift curve without storing it.
+ * Call this when the unit restarts for a non-comfort reason.
+ */
+def discardCurve() {
+    if (device.currentValue("curveActive") != "true") return
+    int points = (state.activeCurve?.size() ?: 0)
+    state.remove("activeCurve")
+    state.remove("activeSeason")
+    sendEvent(name: "curveActive", value: "false")
+    logDebug "discardCurve: abandoned curve with ${points} points"
+}
+
+/**
+ * Clear all stored curves and reset attributes for the specified season.
+ * Use "all" to wipe both seasons (full reset).
+ */
+def resetLearning(String season) {
+    if (season == "cool" || season == "all") {
+        state.remove("curvesCool")
+        sendEvent(name: "kCool",        value: 0)
+        sendEvent(name: "kCoolSamples", value: 0)
+        sendEvent(name: "kCoolReady",   value: "false")
+        log.info "${device.displayName}: resetLearning  cooling data cleared"
+    }
+    if (season == "heat" || season == "all") {
+        state.remove("curvesHeat")
+        sendEvent(name: "kHeat",        value: 0)
+        sendEvent(name: "kHeatSamples", value: 0)
+        sendEvent(name: "kHeatReady",   value: "false")
+        log.info "${device.displayName}: resetLearning  heating data cleared"
+    }
+    if (device.currentValue("curveActive") == "true") discardCurve()
+}
+
+//  Logging 
+
+private void logDebug(String msg) {
+    if (logEnable) log.debug "${device.displayName}: ${msg}"
+}
