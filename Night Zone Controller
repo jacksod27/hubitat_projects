@@ -1,0 +1,503 @@
+/**
+ *  Night Zone Controller — Child driver for Multi Head Midea app
+ *  Namespace: custom.myMidea
+ *
+ *  OVERVIEW
+ *  ────────
+ *  Auto-created by the Multi Head Midea app — one instance per zone.
+ *  Do not create manually. The app creates it on initialize() and seeds it with
+ *  the zone's current preference values as the starting state.
+ *
+ *  SWITCH BEHAVIOUR (replaces global nightModeSwitch)
+ *  ───────────────────────────────────────────────────
+ *  Implements Switch capability. Toggle from any Hubitat dashboard tile:
+ *    on()      → forces quietHoursActive=true regardless of schedule (manual override)
+ *    off()     → forces quietHoursActive=false regardless of schedule (manual override)
+ *    refresh() → clears manual override, re-evaluates from time schedule
+ *
+ *  SETTINGS MODES
+ *  ──────────────
+ *  Base settings     — persisted as device attributes. Written to app prefs via commitToApp().
+ *  Temporary settings — stored in state.tempSettings with an expiry timestamp.
+ *                       Auto-expire at configured time (default 06:00 next morning).
+ *                       Commands: setQuietHoursTemp(), setNightBandTemp(), etc.
+ *                       Cleared by: clearTemp() or automatic expiry.
+ *
+ *  Reading priority per attribute:
+ *    1. Temp setting (if set and not expired)
+ *    2. Driver base attribute
+ *    3. App preference fallback (handled in app)
+ *    4. Built-in default (handled in app)
+ *
+ *  APP SYNC
+ *  ────────
+ *  initFromApp(map)       — called by app on initialize to seed driver with current prefs.
+ *                           Only seeds if not already seeded (won't overwrite user changes).
+ *  commitToApp()          — pushes all current base attributes back to app preferences.
+ *                           Makes changes permanent and visible in Hubitat app UI.
+ *  getNightSettings()     — called by app each cycle; returns effective settings map
+ *                           respecting temp overrides and cleared flags.
+ *  updateZoneNightSettings() — method on the parent app invoked by commitToApp().
+ */
+
+metadata {
+    definition(
+        name:        "Night Zone Controller",
+        namespace:   "custom.myMidea",
+        author:      "Multi Head Midea",
+        description: "Per-zone quiet hours and night comfort settings — child of Multi Head Midea app"
+    ) {
+        capability "Actuator"
+        capability "Sensor"
+        capability "Refresh"
+        capability "Switch"      // on = quiet forced active, off = quiet forced inactive
+
+        // ── Base quiet hours ──────────────────────────────────────────────────
+        attribute "quietStart",       "string"   // "HH:mm"
+        attribute "quietEnd",         "string"   // "HH:mm"
+        attribute "quietHoursActive", "string"   // "true" / "false" — computed
+        attribute "offOvernight",     "string"   // "true" / "false"
+
+        // ── Base night comfort band ───────────────────────────────────────────
+        attribute "nightMinTemp",      "number"  // °C
+        attribute "nightMaxTemp",      "number"  // °C
+        attribute "nightAHDryTrigger", "number"  // g/m³
+        attribute "nightAHFanRestore", "number"  // g/m³
+        attribute "nightHysteresis",   "number"  // °C
+
+        // ── Temporary settings status ─────────────────────────────────────────
+        attribute "tempActive",    "string"   // "true" / "false"
+        attribute "tempExpiresAt", "string"   // "HH:mm" or "none"
+
+        // ── Meta ──────────────────────────────────────────────────────────────
+        attribute "zoneName", "string"
+
+        // ── Base setting commands ─────────────────────────────────────────────
+        command "setQuietHours",   [[name:"start*",      type:"STRING", description:"HH:mm e.g. 22:00"],
+                                    [name:"end*",        type:"STRING", description:"HH:mm e.g. 07:00"]]
+        command "setNightBand",    [[name:"minTemp*",    type:"NUMBER", description:"Lower feels-like °C"],
+                                    [name:"maxTemp*",    type:"NUMBER", description:"Upper feels-like °C"]]
+        command "setNightAH",      [[name:"dryTrigger*", type:"NUMBER", description:"Fan→Dry trigger g/m³"],
+                                    [name:"fanRestore*", type:"NUMBER", description:"Dry→Fan restore g/m³"]]
+        command "setHysteresis",   [[name:"value*",      type:"NUMBER", description:"°C buffer before re-engaging compressor"]]
+        command "setOffOvernight", [[name:"enabled*",    type:"ENUM",   constraints:["true","false"]]]
+        command "clearNightBand"
+        command "clearNightAH"
+
+        // ── Temporary setting commands ────────────────────────────────────────
+        command "setQuietHoursTemp",   [[name:"start*",      type:"STRING", description:"HH:mm"],
+                                        [name:"end*",        type:"STRING", description:"HH:mm"],
+                                        [name:"expiryTime",  type:"STRING", description:"Expire at HH:mm (blank = use default)"]]
+        command "setNightBandTemp",    [[name:"minTemp*",    type:"NUMBER", description:"°C"],
+                                        [name:"maxTemp*",    type:"NUMBER", description:"°C"],
+                                        [name:"expiryTime",  type:"STRING", description:"Expire at HH:mm (blank = use default)"]]
+        command "setNightAHTemp",      [[name:"dryTrigger*", type:"NUMBER", description:"g/m³"],
+                                        [name:"fanRestore*", type:"NUMBER", description:"g/m³"],
+                                        [name:"expiryTime",  type:"STRING", description:"Expire at HH:mm (blank = use default)"]]
+        command "setHysteresisTemp",   [[name:"value*",      type:"NUMBER", description:"°C"],
+                                        [name:"expiryTime",  type:"STRING", description:"Expire at HH:mm (blank = use default)"]]
+        command "setOffOvernightTemp", [[name:"enabled*",    type:"ENUM",   constraints:["true","false"]],
+                                        [name:"expiryTime",  type:"STRING", description:"Expire at HH:mm (blank = use default)"]]
+        command "clearTemp"
+
+        // ── App sync ──────────────────────────────────────────────────────────
+        command "commitToApp"
+    }
+
+    preferences {
+        input "defaultExpiryTime", "time", title: "Default temp setting expiry time (next occurrence)", defaultValue: "06:00", required: false
+        input "logEnable",         "bool", title: "Enable debug logging", defaultValue: true
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// LIFECYCLE
+// ──────────────────────────────────────────────────────────────────────────────
+
+def installed() {
+    if (!parent) {
+        log.warn "[${device.displayName}] This device was not created by the Multi Head Midea app and will not function correctly. Delete it and re-save the app to auto-create a properly linked device."
+    }
+    logDebug "Installed as child of ${parent?.label ?: 'unknown — see warning above'}"
+    sendEvent(name: "switch",           value: "off")
+    sendEvent(name: "quietHoursActive", value: "false")
+    sendEvent(name: "offOvernight",     value: "false")
+    sendEvent(name: "tempActive",       value: "false")
+    sendEvent(name: "tempExpiresAt",    value: "none")
+    sendEvent(name: "zoneName",         value: device.label ?: device.name)
+    if (!state.tempSettings)    state.tempSettings    = [:]
+    if (!state.manualOverride)  state.manualOverride  = "none"
+    if (state.appSeeded == null) state.appSeeded      = false
+}
+
+def updated() {
+    logDebug "Preferences updated"
+    refresh()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SWITCH — on()/off() replace global nightModeSwitch for this zone
+// ──────────────────────────────────────────────────────────────────────────────
+
+def on() {
+    logDebug "on() — manual quiet override active"
+    state.manualOverride = "on"
+    sendEvent(name: "switch",           value: "on")
+    sendEvent(name: "quietHoursActive", value: "true",
+              descriptionText: "Quiet hours manually forced ON")
+}
+
+def off() {
+    logDebug "off() — manual quiet override cleared"
+    state.manualOverride = "off"
+    sendEvent(name: "switch",           value: "off")
+    sendEvent(name: "quietHoursActive", value: "false",
+              descriptionText: "Quiet hours manually forced OFF")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// REFRESH — clears manual override, checks temp expiry, recomputes quietHoursActive
+// ──────────────────────────────────────────────────────────────────────────────
+
+def refresh() {
+    checkTempExpiry()
+
+    if (state.manualOverride == "on") {
+        sendEvent(name: "switch", value: "on")
+        sendEvent(name: "quietHoursActive", value: "true")
+        logDebug "refresh: manual override=on"
+        return
+    }
+    if (state.manualOverride == "off") {
+        sendEvent(name: "switch", value: "off")
+        sendEvent(name: "quietHoursActive", value: "false")
+        logDebug "refresh: manual override=off"
+        return
+    }
+
+    // Evaluate time schedule — temp quietStart/End take priority if set
+    def startStr = getEffectiveAttr("quietStart") as String
+    def endStr   = getEffectiveAttr("quietEnd")   as String
+
+    if (!startStr || startStr == "null" || !endStr || endStr == "null") {
+        sendEvent(name: "switch", value: "off")
+        sendEvent(name: "quietHoursActive", value: "false")
+        logDebug "refresh: no quiet hours configured"
+        return
+    }
+
+    boolean active = computeQuietActive(startStr, endStr)
+    sendEvent(name: "switch",           value: active ? "on" : "off")
+    sendEvent(name: "quietHoursActive", value: active ? "true" : "false",
+              descriptionText: "Quiet hours ${active ? 'active' : 'inactive'} (${startStr}–${endStr})")
+    logDebug "refresh: quietHoursActive=${active} (${startStr}–${endStr})"
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// BASE SETTING COMMANDS
+// ──────────────────────────────────────────────────────────────────────────────
+
+def setQuietHours(String start, String end) {
+    if (!validateTime(start) || !validateTime(end)) {
+        log.warn "[${device.displayName}] setQuietHours: invalid format — use HH:mm"
+        return
+    }
+    sendEvent(name: "quietStart", value: start, descriptionText: "Quiet start → ${start}")
+    sendEvent(name: "quietEnd",   value: end,   descriptionText: "Quiet end → ${end}")
+    state.manualOverride = "none"
+    logDebug "setQuietHours: ${start}–${end}"
+    refresh()
+}
+
+def setNightBand(Number minTemp, Number maxTemp) {
+    if (minTemp >= maxTemp) { log.warn "[${device.displayName}] setNightBand: min must be < max"; return }
+    state.nightMinTempCleared = false
+    state.nightMaxTempCleared = false
+    sendEvent(name: "nightMinTemp", value: minTemp, unit: "°C")
+    sendEvent(name: "nightMaxTemp", value: maxTemp, unit: "°C")
+    logDebug "setNightBand: ${minTemp}–${maxTemp}°C"
+}
+
+def setNightAH(Number dryTrigger, Number fanRestore) {
+    if (fanRestore >= dryTrigger) { log.warn "[${device.displayName}] setNightAH: fanRestore must be < dryTrigger"; return }
+    state.nightAHDryCleared = false
+    state.nightAHFanCleared = false
+    sendEvent(name: "nightAHDryTrigger", value: dryTrigger, unit: "g/m³")
+    sendEvent(name: "nightAHFanRestore", value: fanRestore, unit: "g/m³")
+    logDebug "setNightAH: dry=${dryTrigger} fan=${fanRestore}"
+}
+
+def setHysteresis(Number value) {
+    sendEvent(name: "nightHysteresis", value: value, unit: "°C")
+    logDebug "setHysteresis: ${value}°C"
+}
+
+def setOffOvernight(String enabled) {
+    sendEvent(name: "offOvernight", value: (enabled == "true") ? "true" : "false")
+    logDebug "setOffOvernight: ${enabled}"
+}
+
+def clearNightBand() {
+    // Cleared flags tell getNightSettings() to return null → app pref fallback
+    state.nightMinTempCleared = true
+    state.nightMaxTempCleared = true
+    sendEvent(name: "nightMinTemp", value: 0, descriptionText: "Night band cleared — using app pref")
+    sendEvent(name: "nightMaxTemp", value: 0, descriptionText: "Night band cleared — using app pref")
+    logDebug "clearNightBand"
+}
+
+def clearNightAH() {
+    state.nightAHDryCleared = true
+    state.nightAHFanCleared = true
+    sendEvent(name: "nightAHDryTrigger", value: 0, descriptionText: "Night AH cleared — using app pref")
+    sendEvent(name: "nightAHFanRestore", value: 0, descriptionText: "Night AH cleared — using app pref")
+    logDebug "clearNightAH"
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TEMPORARY SETTING COMMANDS
+// ──────────────────────────────────────────────────────────────────────────────
+
+def setQuietHoursTemp(String start, String end, String expiryTime = null) {
+    if (!validateTime(start) || !validateTime(end)) { log.warn "[${device.displayName}] setQuietHoursTemp: invalid time"; return }
+    def expMs = resolveExpiry(expiryTime)
+    initTemp(expMs)
+    state.tempSettings.quietStart = start
+    state.tempSettings.quietEnd   = end
+    state.manualOverride = "none"
+    updateTempStatus(expMs)
+    logDebug "setQuietHoursTemp: ${start}–${end}, expires ${new Date(expMs).format('HH:mm', location.timeZone)}"
+    refresh()
+}
+
+def setNightBandTemp(Number minTemp, Number maxTemp, String expiryTime = null) {
+    if (minTemp >= maxTemp) { log.warn "[${device.displayName}] setNightBandTemp: min must be < max"; return }
+    def expMs = resolveExpiry(expiryTime)
+    initTemp(expMs)
+    state.tempSettings.nightMinTemp = minTemp
+    state.tempSettings.nightMaxTemp = maxTemp
+    updateTempStatus(expMs)
+    logDebug "setNightBandTemp: ${minTemp}–${maxTemp}°C, expires ${new Date(expMs).format('HH:mm', location.timeZone)}"
+}
+
+def setNightAHTemp(Number dryTrigger, Number fanRestore, String expiryTime = null) {
+    if (fanRestore >= dryTrigger) { log.warn "[${device.displayName}] setNightAHTemp: fanRestore must be < dryTrigger"; return }
+    def expMs = resolveExpiry(expiryTime)
+    initTemp(expMs)
+    state.tempSettings.nightAHDryTrigger = dryTrigger
+    state.tempSettings.nightAHFanRestore = fanRestore
+    updateTempStatus(expMs)
+    logDebug "setNightAHTemp: dry=${dryTrigger} fan=${fanRestore}, expires ${new Date(expMs).format('HH:mm', location.timeZone)}"
+}
+
+def setHysteresisTemp(Number value, String expiryTime = null) {
+    def expMs = resolveExpiry(expiryTime)
+    initTemp(expMs)
+    state.tempSettings.nightHysteresis = value
+    updateTempStatus(expMs)
+    logDebug "setHysteresisTemp: ${value}°C, expires ${new Date(expMs).format('HH:mm', location.timeZone)}"
+}
+
+def setOffOvernightTemp(String enabled, String expiryTime = null) {
+    def expMs = resolveExpiry(expiryTime)
+    initTemp(expMs)
+    state.tempSettings.offOvernight = (enabled == "true")
+    updateTempStatus(expMs)
+    logDebug "setOffOvernightTemp: ${enabled}, expires ${new Date(expMs).format('HH:mm', location.timeZone)}"
+}
+
+def clearTemp() {
+    state.tempSettings    = [:]
+    state.tempExpiresAtMs = null
+    sendEvent(name: "tempActive",    value: "false")
+    sendEvent(name: "tempExpiresAt", value: "none", descriptionText: "Temporary settings cleared")
+    logDebug "clearTemp"
+    refresh()
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// APP SYNC — commitToApp() / initFromApp() / getNightSettings()
+// ──────────────────────────────────────────────────────────────────────────────
+
+// Push base attributes back to parent app preferences — makes changes permanent
+def commitToApp() {
+    if (!parent) {
+        log.warn "[${device.displayName}] commitToApp: no parent app found — this device was not created by the Multi Head Midea app. Delete it and re-save the app to auto-create a properly linked replacement."
+        return
+    }
+    def s = [
+        quietStart        : safeAttr("quietStart"),
+        quietEnd          : safeAttr("quietEnd"),
+        offOvernight      : device.currentValue("offOvernight") == "true",
+        nightMinTemp      : state.nightMinTempCleared ? null : safeNumAttr("nightMinTemp"),
+        nightMaxTemp      : state.nightMaxTempCleared ? null : safeNumAttr("nightMaxTemp"),
+        nightAHDryTrigger : state.nightAHDryCleared   ? null : safeNumAttr("nightAHDryTrigger"),
+        nightAHFanRestore : state.nightAHFanCleared   ? null : safeNumAttr("nightAHFanRestore"),
+        nightHysteresis   : safeNumAttr("nightHysteresis")
+    ]
+    logDebug "commitToApp: ${s}"
+    try {
+        parent.updateZoneNightSettings(device.deviceNetworkId, s)
+        state.pendingReseed = false
+        logDebug "commitToApp: SUCCESS"
+    } catch (e) {
+        log.error "[${device.displayName}] commitToApp failed: ${e}"
+    }
+}
+
+// Called by app on initialize — seeds driver with zone's current preferences.
+// Safe to call repeatedly — won't overwrite user changes made via commands after first seed.
+// Set forceReseed=true to overwrite (e.g. user explicitly re-links zone in app).
+def initFromApp(Map s, boolean forceReseed = false) {
+    if (state.appSeeded && !forceReseed && !state.pendingReseed) {
+        logDebug "initFromApp: already seeded, skipping (call commitToApp() to sync changes back first)"
+        return
+    }
+    logDebug "initFromApp: seeding from app — ${s}"
+
+    if (s.quietStart)            sendEvent(name: "quietStart",        value: s.quietStart)
+    if (s.quietEnd)              sendEvent(name: "quietEnd",          value: s.quietEnd)
+    if (s.offOvernight != null)  sendEvent(name: "offOvernight",      value: s.offOvernight ? "true" : "false")
+    if (s.nightMinTemp)          { sendEvent(name: "nightMinTemp",      value: s.nightMinTemp,      unit: "°C"); state.nightMinTempCleared = false }
+    if (s.nightMaxTemp)          { sendEvent(name: "nightMaxTemp",      value: s.nightMaxTemp,      unit: "°C"); state.nightMaxTempCleared = false }
+    if (s.nightAHDryTrigger)     { sendEvent(name: "nightAHDryTrigger", value: s.nightAHDryTrigger, unit: "g/m³"); state.nightAHDryCleared = false }
+    if (s.nightAHFanRestore)     { sendEvent(name: "nightAHFanRestore", value: s.nightAHFanRestore, unit: "g/m³"); state.nightAHFanCleared = false }
+    if (s.nightHysteresis)       sendEvent(name: "nightHysteresis",   value: s.nightHysteresis,   unit: "°C")
+    if (s.zoneName)              sendEvent(name: "zoneName",          value: s.zoneName)
+
+    state.appSeeded     = true
+    state.pendingReseed = false
+    refresh()
+}
+
+// Called by app each control cycle — returns effective settings map honouring temp overrides
+def getNightSettings() {
+    checkTempExpiry()
+    def t = state.tempSettings ?: [:]
+
+    // eff(): temp value if present, else base attribute (respecting cleared flags), else null
+    def eff = { String attr, boolean checkCleared = false, String clearedFlag = null ->
+        if (t.containsKey(attr)) return t[attr]
+        if (checkCleared && state[clearedFlag]) return null
+        def v = device.currentValue(attr)
+        if (v == null || v == "null") return null
+        if (checkCleared && (v == 0 || v == 0G)) return null  // sentinel for cleared numeric
+        return v
+    }
+
+    return [
+        quietStart        : eff("quietStart"),
+        quietEnd          : eff("quietEnd"),
+        offOvernight      : t.containsKey("offOvernight") ? t.offOvernight : (device.currentValue("offOvernight") == "true"),
+        nightMinTemp      : eff("nightMinTemp",      true, "nightMinTempCleared"),
+        nightMaxTemp      : eff("nightMaxTemp",      true, "nightMaxTempCleared"),
+        nightAHDryTrigger : eff("nightAHDryTrigger", true, "nightAHDryCleared"),
+        nightAHFanRestore : eff("nightAHFanRestore", true, "nightAHFanCleared"),
+        nightHysteresis   : eff("nightHysteresis"),
+        manualOverride    : (state.manualOverride ?: "none"),
+        tempActive        : !t.isEmpty(),
+        tempExpiresAtMs   : state.tempExpiresAtMs
+    ]
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// PRIVATE HELPERS
+// ──────────────────────────────────────────────────────────────────────────────
+
+private void initTemp(Long expMs) {
+    if (!state.tempSettings) state.tempSettings = [:]
+    // Use the earlier expiry if one is already set
+    if (!state.tempExpiresAtMs || expMs < (state.tempExpiresAtMs as Long)) {
+        state.tempExpiresAtMs = expMs
+    }
+}
+
+private void updateTempStatus(Long expMs) {
+    def expiryStr = new Date(expMs).format("HH:mm", location.timeZone)
+    sendEvent(name: "tempActive",    value: "true")
+    sendEvent(name: "tempExpiresAt", value: expiryStr,
+              descriptionText: "Temp settings active — expire at ${expiryStr}")
+}
+
+private void checkTempExpiry() {
+    if (!state.tempSettings || (state.tempSettings as Map).isEmpty()) return
+    Long expMs = state.tempExpiresAtMs as Long
+    if (expMs && now() >= expMs) {
+        logDebug "Temp settings expired — clearing"
+        state.tempSettings    = [:]
+        state.tempExpiresAtMs = null
+        sendEvent(name: "tempActive",    value: "false")
+        sendEvent(name: "tempExpiresAt", value: "none",
+                  descriptionText: "Temporary settings expired")
+    }
+}
+
+private Long resolveExpiry(String expiryTime) {
+    // Resolve "HH:mm" string to millisecond timestamp for its next occurrence
+    def timeStr = "06:00"
+    if (expiryTime && validateTime(expiryTime)) {
+        timeStr = expiryTime
+    } else if (defaultExpiryTime) {
+        try { timeStr = new Date(timeToday(defaultExpiryTime, location.timeZone).time).format("HH:mm", location.timeZone) }
+        catch (e) { timeStr = "06:00" }
+    }
+
+    def tz  = location.timeZone
+    def now = new Date()
+    def (h, m) = timeStr.split(":").collect { it as Integer }
+
+    def cal = Calendar.getInstance(tz)
+    cal.set(Calendar.HOUR_OF_DAY, h)
+    cal.set(Calendar.MINUTE, m)
+    cal.set(Calendar.SECOND, 0)
+    cal.set(Calendar.MILLISECOND, 0)
+    if (cal.time <= now) cal.add(Calendar.DATE, 1)
+
+    return cal.time.time
+}
+
+private def getEffectiveAttr(String attr) {
+    def t = state.tempSettings ?: [:]
+    return t.containsKey(attr) ? t[attr] : device.currentValue(attr)
+}
+
+private def safeAttr(String attr) {
+    def v = device.currentValue(attr)
+    return (v == null || v == "null") ? null : v
+}
+
+private def safeNumAttr(String attr) {
+    def v = device.currentValue(attr)
+    if (v == null || v == "null" || v == 0 || v == 0G) return null
+    try { return v as BigDecimal } catch (e) { return null }
+}
+
+private boolean computeQuietActive(String startStr, String endStr) {
+    try {
+        def tz      = location.timeZone
+        def now     = new Date()
+        def nowMins = (now.format("H", tz) as Integer) * 60 + (now.format("m", tz) as Integer)
+        def (sH, sM) = startStr.split(":").collect { it as Integer }
+        def (eH, eM) = endStr.split(":").collect   { it as Integer }
+        def sMins = sH * 60 + sM
+        def eMins = eH * 60 + eM
+        return (sMins > eMins) ? (nowMins >= sMins || nowMins < eMins)   // overnight
+                               : (nowMins >= sMins && nowMins < eMins)   // same-day
+    } catch (e) {
+        log.warn "[${device.displayName}] computeQuietActive error: ${e}"
+        return false
+    }
+}
+
+private boolean validateTime(String t) {
+    if (!t) return false
+    try {
+        def p = t.split(":")
+        if (p.size() != 2) return false
+        return (p[0] as Integer) in 0..23 && (p[1] as Integer) in 0..59
+    } catch (e) { return false }
+}
+
+private void logDebug(String msg) {
+    if (logEnable) log.debug "[${device.displayName}] ${msg}"
+}
