@@ -1,0 +1,143 @@
+// MideaThermalLearning - Thermal inertia learning library
+// Namespace: myMidea
+//
+// Newton's law of cooling/heating approximation for predicting room drift after AC shuts off.
+// Used to gate comfort shutdown decisions in MultiHeadMidea3.
+//
+// Newton's law: coolingRate = k * (indoorTemp - outT)
+//               timeToEdge  = (feelsLike - bandEdge) / coolingRate  [minutes]
+//
+// k is derived empirically from recorded drift curves. Each completed drift
+// (AC off -> room reaches band edge) contributes one k sample. Separate kCool
+// and kHeat per zone: different thermal conductances due to stack effect,
+// occupancy patterns, and seasonal ventilation habits.
+//
+// Minimum MIN_SAMPLES_FOR_K (10) completed curves required before k is trusted.
+// Below this threshold caller falls back to thermalProximityMargin proxy.
+//
+// Functions:
+//   kFromCurve(startFL, endFL, outT, elapsedMin) - k from a single drift interval
+//   kFromDriftCurve(curve)                       - k from a completed curve (list of points)
+//   deriveK(curves)                              - median k from all completed curves
+//   hasEnoughData(curves)                        - gate: >= MIN_SAMPLES_FOR_K valid curves
+//   timeToEdge(feelsLike, bandEdge, k, outT)     - predicted minutes to band edge
+//   addCurve(curves, newCurve)                   - append curve to rolling window
+
+library (
+	author:      "Midea AC Zone Control",
+	description: "Thermal inertia learning for Midea AC zone control",
+	name:        "MideaThermalLearning",
+	namespace:   "myMidea"
+)
+
+import groovy.transform.Field
+
+// ------ Constants ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// MIN_SAMPLES_FOR_K: minimum completed curves before k is saved and trusted
+@Field static final int MIN_SAMPLES_FOR_K = 10
+// MAX_STORED_SAMPLES: rolling window size -- oldest curves dropped beyond this
+@Field static final int MAX_STORED_SAMPLES = 50
+// MIN_DELTA_FOR_K: minimum indoor-outdoor temp delta to derive k (avoids divide-by-zero on mild days)
+@Field static final BigDecimal MIN_DELTA_FOR_K = 1.0G
+// MIN_DRIFT_FOR_CURVE: minimum feelsLike change across a curve (filters near-stationary noise)
+@Field static final BigDecimal MIN_DRIFT_FOR_CURVE = 0.3G
+// K_OUTLIER_FLOOR / CEILING: physically plausible k range -- values outside are discarded
+@Field static final BigDecimal K_OUTLIER_FLOOR = 0.001G
+@Field static final BigDecimal K_OUTLIER_CEILING = 0.500G
+
+// ------ k Derivation ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// kFromCurve(startFL, endFL, outT, elapsedMin)
+// Calculate k for a single drift interval using Newton's law.
+// k = (dFeelsLike / dt) / (feelsLike_mean - outT)
+// dFeelsLike = magnitude of feelsLike change over interval
+// dt = elapsed time in minutes
+// feelsLike_mean = mean of start and end feelsLike
+// outT = outdoor temperature (assumed stable over short interval)
+// Returns null if delta is too small or inputs are degenerate.
+BigDecimal kFromCurve(BigDecimal startFL, BigDecimal endFL, BigDecimal outT, BigDecimal elapsedMin) {
+    if (elapsedMin <= 0G) return null
+    BigDecimal driftFL = (startFL - endFL).abs()
+    if (driftFL < MIN_DRIFT_FOR_CURVE) return null
+    BigDecimal meanFL  = (startFL + endFL) / 2G
+    BigDecimal delta   = (meanFL - outT).abs()
+    if (delta < MIN_DELTA_FOR_K) return null
+    BigDecimal rate    = driftFL / elapsedMin
+    BigDecimal k       = rate / delta
+    if (k < K_OUTLIER_FLOOR || k > K_OUTLIER_CEILING) return null
+    return k.setScale(5, BigDecimal.ROUND_HALF_UP)
+}
+
+// kFromDriftCurve(curve)
+// Derive k from a completed drift curve (list of timed feelsLike + outT readings).
+// curve = List of Maps: [[feelsLike: x, outT: y, timestampMs: z], ...] sorted oldest-first.
+// Uses first and last points -- sufficient given ~1-min sampling and room thermal stability.
+// Returns null if curve has fewer than 2 points or is otherwise invalid.
+BigDecimal kFromDriftCurve(List curve) {
+    if (!curve || curve.size() < 2) return null
+    def first = curve.first()
+    def last  = curve.last()
+    BigDecimal startFL    = first.feelsLike as BigDecimal
+    BigDecimal endFL      = last.feelsLike  as BigDecimal
+    BigDecimal outT       = first.outT      as BigDecimal
+    BigDecimal elapsedMin = ((last.timestampMs as Long) - (first.timestampMs as Long)) / 60000G
+    return kFromCurve(startFL, endFL, outT, elapsedMin)
+}
+
+// deriveK(curves)
+// Derive k from a list of completed curves using the median.
+// Outliers filtered by kFromDriftCurve before median is taken.
+// Returns null if fewer than MIN_SAMPLES_FOR_K valid curves exist.
+BigDecimal deriveK(List curves) {
+    if (!curves) return null
+    List kValues = curves.collect { kFromDriftCurve(it) }.findAll { it != null }
+    if (kValues.size() < MIN_SAMPLES_FOR_K) return null
+    List sorted = kValues.sort()
+    int n = sorted.size()
+    if (n % 2 == 1) return sorted[n / 2]
+    return ((sorted[n / 2 - 1] + sorted[n / 2]) / 2G).setScale(5, BigDecimal.ROUND_HALF_UP)
+}
+
+// ------ Data Sufficiency ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// hasEnoughData(curves)
+// Returns true if >= MIN_SAMPLES_FOR_K valid k values can be extracted from curves.
+boolean hasEnoughData(List curves) {
+    if (!curves) return false
+    List kValues = curves.collect { kFromDriftCurve(it) }.findAll { it != null }
+    return kValues.size() >= MIN_SAMPLES_FOR_K
+}
+
+// ------ Prediction ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// timeToEdge(feelsLike, bandEdge, k, outT)
+// Predict minutes until feelsLike drifts to band edge after AC shuts off.
+// coolingRate = k * |feelsLike - outT|
+// timeToEdge  = |feelsLike - bandEdge| / coolingRate
+// Returns null if k is null or inputs are degenerate.
+// Returns 0 if already at edge (within 0.1C).
+// Returns 999 if driving force is negligible (outT near indoorTemp -- drift very slow).
+BigDecimal timeToEdge(BigDecimal feelsLike, BigDecimal bandEdge, BigDecimal k, BigDecimal outT) {
+    if (k == null || feelsLike == null || bandEdge == null || outT == null) return null
+    BigDecimal driftMagnitude = (feelsLike - bandEdge).abs()
+    if (driftMagnitude < 0.1G) return 0G
+    BigDecimal delta = (feelsLike - outT).abs()
+    if (delta < MIN_DELTA_FOR_K) return 999G
+    BigDecimal rate = k * delta
+    if (rate <= 0G) return 999G
+    return (driftMagnitude / rate).setScale(1, BigDecimal.ROUND_HALF_UP)
+}
+
+// ------ Rolling Window Management ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+// addCurve(curves, newCurve)
+// Append a completed curve to the stored list, trimming to MAX_STORED_SAMPLES.
+// Returns the updated list. Caller is responsible for persisting it.
+List addCurve(List curves, List newCurve) {
+    List updated = (curves ?: []) + [newCurve]
+    if (updated.size() > MAX_STORED_SAMPLES) {
+        updated = updated.drop(updated.size() - MAX_STORED_SAMPLES)
+    }
+    return updated
+}
