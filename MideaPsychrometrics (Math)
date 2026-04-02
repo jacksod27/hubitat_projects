@@ -1,0 +1,99 @@
+// MideaPsychrometrics - Shared psychrometric and thermal math library
+// Namespace: myMidea
+//
+// Pure calculation functions used by MultiHeadMidea3, MideaThermalLearner, MideaThermalLearning.
+// All functions are pure (no side effects, no logging, no state access).
+// Hubitat compiles libraries into the importing app/driver at save time.
+
+library (
+	author:      "Midea AC Zone Control",
+	description: "Psychrometric and thermal math for Midea AC zone control",
+	name:        "MideaPsychrometrics",
+	namespace:   "myMidea"
+)
+
+// ------ Absolute Humidity ------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// calcAH(T, RH)
+// Absolute humidity g/m3 from dry-bulb temperature and relative humidity.
+// Magnus approximation: e_sat = 6.112 * exp(17.67*T / (T+243.5))
+// AH = e_sat * (RH/100) * 216.679 / (T+273.15)
+// Returns null if either input is null.
+BigDecimal calcAH(T, RH) {
+    if (T == null || RH == null) return null
+    BigDecimal t  = (T  as BigDecimal)
+    BigDecimal rh = (RH as BigDecimal)
+    BigDecimal es = 6.112G * Math.exp((17.67G * t) / (t + 243.5G))
+    BigDecimal e  = es * (rh / 100G)
+    return (e * 216.679G / (t + 273.15G)).setScale(3, BigDecimal.ROUND_HALF_UP)
+}
+
+// ------ Feels-Like Temperature ---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// calcFeelsLike(tempC, rh)
+// Simplified humidity adjustment: each RH% above 50 adds 0.05C to perceived temp.
+// Approximates thermal comfort effect without full Steadman heat index.
+// Below 50% RH no adjustment is applied.
+// Returns null if either input is null.
+BigDecimal calcFeelsLike(tempC, rh) {
+    if (tempC == null || rh == null) return null
+    BigDecimal t        = (tempC as BigDecimal)
+    BigDecimal r        = (rh   as BigDecimal)
+    BigDecimal humBonus = (r - 50G).max(0G)
+    return (t + humBonus * 0.05G).setScale(1, BigDecimal.ROUND_HALF_UP)
+}
+
+// ------ Saturation and Condensation ------------------------------------------------------------------------------------------------------------------------------------------
+
+// calcSaturationAH(tempC)
+// Saturation absolute humidity (g/m3) at 100% RH for a given temperature.
+// This is the maximum AH air can hold -- used as condensation threshold on cold surfaces.
+BigDecimal calcSaturationAH(BigDecimal tempC) {
+    double t    = tempC.doubleValue()
+    double eSat = 6.112 * Math.exp(17.67 * t / (t + 243.5))
+    double ah   = 216.679 * eSat / (t + 273.15)
+    return new BigDecimal(ah).setScale(3, BigDecimal.ROUND_HALF_UP)
+}
+
+// calcWindowInnerTemp(tOut, tIn, factor)
+// Estimates inner glazing surface temperature using linear conduction model.
+// T_inner = T_out + (T_in - T_out) * glazingFactor
+// Glazing factors: single=0.10, double standard=0.30, double good=0.40
+BigDecimal calcWindowInnerTemp(BigDecimal tOut, BigDecimal tIn, BigDecimal factor) {
+    return (tOut + (tIn - tOut) * factor).setScale(2, BigDecimal.ROUND_HALF_UP)
+}
+
+// calcMaxSafeAH(tOut, tIn, factor, safetyMargin)
+// Maximum safe indoor AH before condensation risk on glazing.
+// Applies safetyMargin (default 0.5 g/m3) below saturation AH at inner surface temp.
+// Returns 0 if T_inner <= 0C (condensation certain regardless of AH).
+BigDecimal calcMaxSafeAH(BigDecimal tOut, BigDecimal tIn, BigDecimal factor, BigDecimal safetyMargin = 0.5G) {
+    BigDecimal tInner = calcWindowInnerTemp(tOut, tIn, factor)
+    if (tInner <= 0G) return 0G
+    BigDecimal satAH  = calcSaturationAH(tInner)
+    return (satAH - safetyMargin).max(0G)
+}
+
+// ------ Mode Eligibility ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// isDryModeEligible(roomTemp, rh, ahVal, lowAHThreshold)
+// Dry mode is effective at 22-27C with RH >= 55%.
+// Below 22C: unit dehumidifies inefficiently, temp already comfortable.
+// Above 27C: cool mode is the correct tool.
+// RH < 55%: insufficient humidity load.
+// AH < lowAHThreshold (when supplied): over-drying risk.
+// lowAHThreshold defaults to 5.0 g/m3. Pass ahVal=null to skip AH guard.
+boolean isDryModeEligible(BigDecimal roomTemp, BigDecimal rh, BigDecimal ahVal = null, BigDecimal lowAHThreshold = 5.0G) {
+    boolean tempOk = (roomTemp >= 22.0G && roomTemp <= 27.0G)
+    boolean rhOk   = (rh >= 55.0G)
+    boolean ahOk   = (ahVal == null || ahVal >= lowAHThreshold)
+    return tempOk && rhOk && ahOk
+}
+
+// ------ Rounding ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+// roundHalf(v)
+// Round to nearest 0.5C step. Midea hardware only accepts 0.5C setpoint increments.
+BigDecimal roundHalf(BigDecimal v) {
+    return (v * 2G).setScale(0, BigDecimal.ROUND_HALF_UP) / 2G
+}
